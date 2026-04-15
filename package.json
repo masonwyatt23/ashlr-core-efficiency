@@ -1,0 +1,24 @@
+{
+    "name": "@ashlr/core-efficiency",
+    "version": "0.1.0",
+    "description": "Token-efficiency primitives for Claude Code: genome, compression, provider-aware budgeting.",
+    "license": "MIT",
+    "type": "module",
+    "main": "./src/index.ts",
+    "exports": {
+        ".": "./src/index.ts",
+        "./genome": "./src/genome/index.ts",
+        "./compression": "./src/compression/index.ts",
+        "./budget": "./src/budget/index.ts",
+        "./tokens": "./src/tokens/index.ts"
+    },
+    "scripts": {
+        "test": "bun test",
+        "build": "bun build ./src/index.ts --outdir ./dist --target node",
+        "typecheck": "tsc --noEmit"
+    },
+    "devDependencies": {
+        "@types/bun": "latest",
+        "typescript": "^5.7.0"
+    }
+}
