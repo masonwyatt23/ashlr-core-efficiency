@@ -1,22 +1,50 @@
-// Consolidates the 3 duplicate estimateTokens() heuristics found in ashlrcode
-// (src/agent/context.ts, src/agent/system-prompt.ts, src/genome/manifest.ts).
+/**
+ * Token estimation — single source of truth.
+ *
+ * Chars/4 heuristic. Good enough for budgeting and cost estimation; the
+ * real token count comes back from the provider in usage events.
+ */
 
-export function estimateTokens(input: string | { content: unknown }[]): number {
-  if (typeof input === "string") {
-    return Math.ceil(input.length / 4);
-  }
-  // Message array — sum approximate chars from content
-  let total = 0;
-  for (const msg of input) {
-    const c = msg.content;
-    if (typeof c === "string") total += c.length;
-    else if (Array.isArray(c)) {
-      for (const block of c) {
-        if (block && typeof block === "object" && "text" in block && typeof block.text === "string") {
-          total += block.text.length;
-        }
+import type { ContentBlock, Message } from "../types/index.ts";
+
+/** Estimate tokens in a plain string. */
+export function estimateTokensFromString(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+/** Estimate tokens across a list of provider Messages (handles content blocks). */
+export function estimateTokensFromMessages(messages: Message[]): number {
+  let chars = 0;
+  for (const msg of messages) {
+    if (typeof msg.content === "string") {
+      chars += msg.content.length;
+    } else {
+      for (const block of msg.content) {
+        chars += blockCharCount(block);
       }
     }
   }
-  return Math.ceil(total / 4);
+  return Math.ceil(chars / 4);
+}
+
+/** Unified entry point — dispatches by input shape. */
+export function estimateTokens(input: string | Message[]): number {
+  return typeof input === "string"
+    ? estimateTokensFromString(input)
+    : estimateTokensFromMessages(input);
+}
+
+function blockCharCount(block: ContentBlock): number {
+  switch (block.type) {
+    case "text":
+      return block.text.length;
+    case "thinking":
+      return block.thinking.length;
+    case "tool_use":
+      return block.name.length + JSON.stringify(block.input).length;
+    case "tool_result":
+      return block.content.length;
+    case "image_url":
+      return 1000; // ~1000 tokens per image
+  }
 }

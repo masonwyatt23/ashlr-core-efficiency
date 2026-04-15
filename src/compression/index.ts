@@ -1,6 +1,10 @@
-// Phase B: port from ashlrcode/src/agent/
-// Files to move: context.ts (compression tiers), system-prompt.ts (builder)
-// estimateTokens() moves to ../tokens/ (consolidated from 3 duplicates)
-// Add: priority.ts — PromptPriority enum replacing 11 magic numbers
+/**
+ * Compression module — 3-tier context compression + prompt-priority slots.
+ *
+ * system-prompt.ts (the builder) stays in ashlrcode because it couples to
+ * ashlrcode-specific subsystems (tool registry, model patches, settings,
+ * undercover mode). Only the reusable efficiency primitives live here.
+ */
 
-export const COMPRESSION_MODULE_STATUS = "placeholder" as const;
+export * from "./context.ts";
+export * from "./priority.ts";

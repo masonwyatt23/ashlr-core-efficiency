@@ -23,8 +23,8 @@ describe("estimateTokens", () => {
       {
         role: "assistant" as const,
         content: [
-          { type: "text", text: "block one" },
-          { type: "text", text: "block two" },
+          { type: "text" as const, text: "block one" },
+          { type: "text" as const, text: "block two" },
         ],
       },
     ];
