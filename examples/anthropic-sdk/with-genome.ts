@@ -37,7 +37,7 @@ const system = await withGenome(baseSystem, process.cwd(), {
 console.error(`[genome] system prompt length: ${system.length} chars`);
 
 const stream = client.messages.stream({
-  model: "claude-sonnet-4-5",
+  model: "claude-sonnet-4-6",
   max_tokens: 512,
   system,
   messages: [

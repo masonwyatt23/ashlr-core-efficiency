@@ -28,7 +28,7 @@ const iter = query({
     "Use the ashlr__read tool to read package.json in the current directory " +
     "and summarize the package's purpose in one sentence.",
   options: {
-    model: "claude-sonnet-4-5",
+    model: "claude-sonnet-4-6",
     mcpServers,
     allowedTools: ["mcp__ashlr-efficiency__ashlr__read"],
     permissionMode: "bypassPermissions",

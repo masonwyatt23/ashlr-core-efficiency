@@ -45,7 +45,7 @@ function buildRequest(userQuestion: string) {
 async function ask(q: string, label: string) {
   const req = buildRequest(q);
   const res = await client.messages.create({
-    model: "claude-sonnet-4-5",
+    model: "claude-sonnet-4-6",
     max_tokens: 128,
     ...req,
   });
