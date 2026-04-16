@@ -75,6 +75,63 @@ Integration tests live in the [ashlrcode repo](https://github.com/masonwyatt23/a
 - **`estimateTokens`**: previously duplicated in three places in ashlrcode. Now one implementation, two entry points: `FromString` and `FromMessages` (walks `ContentBlock[]` including tool_use/tool_result).
 - **Genome `commands.ts`**: deliberately kept in ashlrcode (CLI layer, not library code).
 
+## Anthropic SDK integration
+
+Any app built on `@anthropic-ai/sdk` (Messages API) or
+`@anthropic-ai/claude-agent-sdk` (stdio MCP) can pull in ashlr's tools,
+genome RAG, and prompt caching in 2-3 lines:
+
+```typescript
+import {
+  ashlrMcpConfig,   // auto-detect ashlr-plugin → stdio MCP server list
+  withGenome,       // prepend genome RAG context to a system prompt
+  cacheBreakpoints, // add ephemeral cache markers at static/dynamic seams
+} from "@ashlr/core-efficiency/anthropic";
+```
+
+### Quick start
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+import { withGenome, cacheBreakpoints } from "@ashlr/core-efficiency/anthropic";
+
+const client = new Anthropic();
+const system = await withGenome("You are a senior engineer.", process.cwd());
+
+const req = cacheBreakpoints({
+  system,
+  messages: [
+    { role: "user", content: projectContext, cache: true },
+    { role: "user", content: "what does login.ts do?" },
+  ],
+});
+
+await client.messages.create({ ...req, model: "claude-sonnet-4-5", max_tokens: 1024 });
+```
+
+For stdio MCP tools via the Agent SDK:
+
+```typescript
+import { query } from "@anthropic-ai/claude-agent-sdk";
+import { ashlrMcpConfigRecord } from "@ashlr/core-efficiency/anthropic";
+
+const mcpServers = ashlrMcpConfigRecord();  // all 10 plugins, auto-detected
+for await (const msg of query({ prompt: "...", options: { mcpServers } })) { /* ... */ }
+```
+
+`ashlrMcpConfig` auto-detects the plugin root in this order:
+`ASHLR_PLUGIN_ROOT` → `~/.claude/plugins/cache/ashlr-marketplace/ashlr/<latest>/`
+→ `~/Desktop/ashlr-plugin`. Throws `AshlrPluginNotFoundError` with
+remediation steps if nothing is found.
+
+See [`src/anthropic/README.md`](./src/anthropic/README.md) for the full API
+and [`examples/anthropic-sdk/`](./examples/anthropic-sdk/) for runnable
+scenarios (basic MCP, genome injection, prompt caching with hit-rate
+reporting).
+
+`@anthropic-ai/sdk` is an **optional peer dependency** — callers bring
+their own version.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).

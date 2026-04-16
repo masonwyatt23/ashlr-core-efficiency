@@ -10,7 +10,8 @@
     "./genome": "./src/genome/index.ts",
     "./compression": "./src/compression/index.ts",
     "./budget": "./src/budget/index.ts",
-    "./tokens": "./src/tokens/index.ts"
+    "./tokens": "./src/tokens/index.ts",
+    "./anthropic": "./src/anthropic/index.ts"
   },
   "scripts": {
     "test": "bun test",
@@ -23,5 +24,13 @@
   },
   "dependencies": {
     "tiktoken": "^1.0.22"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/sdk": ">=0.40.0"
+  },
+  "peerDependenciesMeta": {
+    "@anthropic-ai/sdk": {
+      "optional": true
+    }
   }
 }
