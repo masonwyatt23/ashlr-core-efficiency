@@ -1,6 +1,6 @@
 {
   "name": "@ashlr/core-efficiency",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Token-efficiency primitives for Claude Code: genome, compression, provider-aware budgeting.",
   "license": "MIT",
   "type": "module",
