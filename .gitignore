@@ -1,7 +1,22 @@
 node_modules/
 dist/
-.DS_Store
 *.log
 bun.lockb
 .env
 .env.*
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~

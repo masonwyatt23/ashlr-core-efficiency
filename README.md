@@ -1,28 +1,51 @@
 # @ashlr/core-efficiency
 
-Token-efficiency primitives for AI coding agents. Extracted from [ashlrcode](https://github.com/masonwyatt23/ashlrcode) and consumed by both the `ashlrcode` CLI and the [ashlr-plugin](https://github.com/masonwyatt23/ashlr-plugin) for Claude Code.
+Token-efficiency primitives for AI coding agents — genome RAG, multi-tier context compression, provider-aware budgeting, and prompt-caching helpers.
 
-**One library, multiple consumers.** Evolution happens in one place.
+Extracted from [ashlrcode](https://github.com/ashlrai/ashlrcode) and shared by the `ashlrcode` CLI and the [ashlr-plugin](https://github.com/ashlrai/ashlr-plugin) for Claude Code.
 
-## What's inside
+**Platform support:** macOS / Linux / Windows on Bun >= 1.0 and Node >= 20.
 
-| Module | Size | Purpose |
-|--------|------|---------|
-| [`/genome`](./src/genome) | ~2,342 LOC | Self-evolving project specs via RAG + scribe protocol. Manifest CRUD, TF-IDF/Ollama retrieval, fitness-based strategy evolution, mutation audit trail. |
-| [`/compression`](./src/compression) | ~470 LOC | 3-tier context compression: `autoCompact` (LLM summarize old turns), `snipCompact` (truncate tool results > 2KB), `contextCollapse` (drop short/dup). Plus `PromptPriority` enum. |
-| [`/budget`](./src/budget) | ~50 LOC | Provider-aware prompt budgeting. `getProviderContextLimit`, `systemPromptBudget(provider, 0.05, 50K cap)`. |
-| [`/tokens`](./src/tokens) | ~50 LOC | Single-impl token estimation (chars/4 heuristic). |
-| [`/types`](./src/types) | ~60 LOC | `Message`, `ContentBlock`, `LLMSummarizer`, `StreamEvent`, `ProviderRequest`. |
+---
+
+## Modules
+
+| Subpath | LOC | Purpose |
+|---------|-----|---------|
+| [`/genome`](./src/genome) | ~2,342 | Self-evolving project specs via RAG + scribe protocol. Manifest CRUD, TF-IDF/Ollama retrieval, fitness-based strategy evolution, mutation audit trail. |
+| [`/compression`](./src/compression) | ~470 | 3-tier context compression: `autoCompact` (LLM summarize old turns), `snipCompact` (truncate tool results > 2 KB), `contextCollapse` (drop short/dup). `PromptPriority` enum. |
+| [`/budget`](./src/budget) | ~50 | Provider-aware prompt budgeting. `getProviderContextLimit`, `systemPromptBudget`. |
+| [`/tokens`](./src/tokens) | ~50 | Token estimation: `estimateTokensFromString`, `estimateTokensFromMessages`. |
+| [`/anthropic`](./src/anthropic) | ~200 | Anthropic SDK helpers: `withGenome`, `cacheBreakpoints`, `ashlrMcpConfig`. |
+| [`/session-log`](./src/session-log) | ~150 | Structured session event log (tool calls, costs, savings). |
+| [`/local`](./src/local) | ~120 | Context-window manager for small-context local models. |
+| [`/types`](./src/types) | ~60 | Shared types: `Message`, `ContentBlock`, `LLMSummarizer`, `StreamEvent`. |
+
+---
 
 ## Install
 
 ```bash
+# Bun (primary runtime)
 bun add @ashlr/core-efficiency
-# or from the repo directly during development:
+
+# npm / pnpm / yarn
+npm install @ashlr/core-efficiency
+```
+
+For local development against a checkout:
+
+```bash
 bun add file:../ashlr-core-efficiency
 ```
 
-## Use
+The package ships TypeScript source in `src/`. Bun runs it directly. For Node.js, compile first with `bun run build` (outputs to `dist/`).
+
+---
+
+## Quickstart
+
+### compression
 
 ```typescript
 import {
@@ -32,64 +55,61 @@ import {
   PromptPriority,
 } from "@ashlr/core-efficiency/compression";
 
+// Truncate any tool result that exceeds 2 KB (head + tail elided middle).
+const trimmed = snipCompact(messages, { maxBytes: 2048 });
+
+// Drop short or duplicate messages to reduce prompt size.
+const collapsed = contextCollapse(messages);
+
+// LLM-summarize old turns when approaching the context limit.
+const compacted = await autoCompact(messages, summarizer, {
+  targetTokens: 50_000,
+  priority: PromptPriority.High,
+});
+```
+
+### budget
+
+```typescript
 import {
   getProviderContextLimit,
   systemPromptBudget,
 } from "@ashlr/core-efficiency/budget";
 
+const limit = getProviderContextLimit("anthropic");     // 200_000
+const budget = systemPromptBudget("anthropic", 0.05, 50_000);  // 5% floor, 50K cap
+```
+
+### tokens
+
+```typescript
+import {
+  estimateTokensFromString,
+  estimateTokensFromMessages,
+} from "@ashlr/core-efficiency/tokens";
+
+const n = estimateTokensFromString("Hello, world!");
+const total = estimateTokensFromMessages(messages);  // walks ContentBlock[] incl. tool results
+```
+
+### genome
+
+```typescript
 import {
   retrieveSectionsV2,
   injectGenomeContext,
   genomeExists,
 } from "@ashlr/core-efficiency/genome";
 
-import { estimateTokensFromString } from "@ashlr/core-efficiency/tokens";
-import type { Message, LLMSummarizer } from "@ashlr/core-efficiency/types";
+if (await genomeExists(process.cwd())) {
+  const sections = await retrieveSectionsV2("architecture overview", process.cwd(), {
+    maxTokens: 2000,
+  });
+  const system = injectGenomeContext(baseSystem, sections);
+}
 ```
 
-Or import everything from the root barrel:
-
-```typescript
-import {
-  autoCompact,
-  getProviderContextLimit,
-  retrieveSectionsV2,
-  estimateTokensFromString,
-} from "@ashlr/core-efficiency";
-```
-
-## Test
-
-```bash
-bun install
-bun test       # ~17 tests (budget + tokens); genome/compression tests live in ashlrcode
-bun run typecheck
-```
-
-Integration tests live in the [ashlrcode repo](https://github.com/masonwyatt23/ashlrcode) — that's where all 746 tests run against a real-world consumer.
-
-## Design notes
-
-- **`LLMSummarizer` interface**: `autoCompact` and genome `scribe` depend on a minimal `{ stream(ProviderRequest): AsyncGenerator<StreamEvent> }` contract, not a concrete router. Consumers inject their own provider. ashlrcode's `ProviderRouter` structurally satisfies it.
-- **`PromptPriority` enum**: 12 named slots (Core=0 → Undercover=95). Numeric values are stable so raw-int callers still work.
-- **`estimateTokens`**: previously duplicated in three places in ashlrcode. Now one implementation, two entry points: `FromString` and `FromMessages` (walks `ContentBlock[]` including tool_use/tool_result).
-- **Genome `commands.ts`**: deliberately kept in ashlrcode (CLI layer, not library code).
-
-## Anthropic SDK integration
-
-Any app built on `@anthropic-ai/sdk` (Messages API) or
-`@anthropic-ai/claude-agent-sdk` (stdio MCP) can pull in ashlr's tools,
-genome RAG, and prompt caching in 2-3 lines:
-
-```typescript
-import {
-  ashlrMcpConfig,   // auto-detect ashlr-plugin → stdio MCP server list
-  withGenome,       // prepend genome RAG context to a system prompt
-  cacheBreakpoints, // add ephemeral cache markers at static/dynamic seams
-} from "@ashlr/core-efficiency/anthropic";
-```
-
-### Quick start
+### anthropic
 
 ```typescript
 import Anthropic from "@anthropic-ai/sdk";
@@ -102,11 +122,11 @@ const req = cacheBreakpoints({
   system,
   messages: [
     { role: "user", content: projectContext, cache: true },
-    { role: "user", content: "what does login.ts do?" },
+    { role: "user", content: "What does login.ts do?" },
   ],
 });
 
-await client.messages.create({ ...req, model: "claude-sonnet-4-5", max_tokens: 1024 });
+await client.messages.create({ ...req, model: "claude-sonnet-4-6", max_tokens: 1024 });
 ```
 
 For stdio MCP tools via the Agent SDK:
@@ -115,22 +135,84 @@ For stdio MCP tools via the Agent SDK:
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { ashlrMcpConfigRecord } from "@ashlr/core-efficiency/anthropic";
 
-const mcpServers = ashlrMcpConfigRecord();  // all 10 plugins, auto-detected
-for await (const msg of query({ prompt: "...", options: { mcpServers } })) { /* ... */ }
+const mcpServers = ashlrMcpConfigRecord({ plugins: ["efficiency"] });
+for await (const msg of query({ prompt: "...", options: { mcpServers } })) {
+  // ...
+}
 ```
 
-`ashlrMcpConfig` auto-detects the plugin root in this order:
-`ASHLR_PLUGIN_ROOT` → `~/.claude/plugins/cache/ashlr-marketplace/ashlr/<latest>/`
-→ `~/Desktop/ashlr-plugin`. Throws `AshlrPluginNotFoundError` with
-remediation steps if nothing is found.
+See [`examples/anthropic-sdk/`](./examples/anthropic-sdk/) for runnable scenarios.
 
-See [`src/anthropic/README.md`](./src/anthropic/README.md) for the full API
-and [`examples/anthropic-sdk/`](./examples/anthropic-sdk/) for runnable
-scenarios (basic MCP, genome injection, prompt caching with hit-rate
-reporting).
+### session-log
 
-`@anthropic-ai/sdk` is an **optional peer dependency** — callers bring
-their own version.
+```typescript
+import { SessionLog } from "@ashlr/core-efficiency/session-log";
+
+const log = new SessionLog();
+log.record({ type: "tool_call", tool: "ashlr__read", inputTokens: 120 });
+console.log(log.summary());
+```
+
+### local
+
+```typescript
+import { LocalContextManager } from "@ashlr/core-efficiency/local";
+
+const mgr = new LocalContextManager({ contextWindow: 4096 });
+const messages = mgr.fit(allMessages);  // drops oldest turns to stay within window
+```
+
+Root barrel export (all subpaths re-exported):
+
+```typescript
+import {
+  autoCompact,
+  getProviderContextLimit,
+  retrieveSectionsV2,
+  estimateTokensFromString,
+} from "@ashlr/core-efficiency";
+```
+
+---
+
+## Compatibility
+
+| Runtime | macOS | Linux | Windows |
+|---------|-------|-------|---------|
+| Bun >= 1.0 | Yes | Yes | Yes |
+| Node >= 20 | Yes (compile first) | Yes (compile first) | Yes (compile first) |
+
+Path separators are normalized internally; no Unix-only assumptions.
+
+---
+
+## Development
+
+```bash
+bun install
+bun test          # ~17 unit tests (budget + tokens)
+bun run typecheck
+bun run build     # emit dist/ for Node consumers
+```
+
+Integration tests live in the [ashlrcode repo](https://github.com/ashlrai/ashlrcode) where 700+ tests run against real-world consumers.
+
+---
+
+## Design notes
+
+- **`LLMSummarizer` interface**: `autoCompact` and genome `scribe` depend on a minimal `{ stream(ProviderRequest): AsyncGenerator<StreamEvent> }` contract, not a concrete router. Consumers inject their own provider.
+- **`PromptPriority` enum**: 12 named slots (`Core=0` through `Undercover=95`). Numeric values are stable — raw-int callers continue to work across versions.
+- **`estimateTokens`**: previously duplicated in three places. Now one implementation, two entry points: `FromString` and `FromMessages` (walks `ContentBlock[]` including `tool_use`/`tool_result`).
+- **Source-first exports**: `main` and `exports` point to `src/`. Bun resolves `.ts` imports directly. For Node.js, run `bun run build` and consume from `dist/`. A `module` field mirrors `main` for bundlers that inspect it.
+
+---
+
+## Versioning
+
+Follows semver. Breaking changes (removed exports, changed interfaces) go to major versions. Additive exports and bug fixes are minor/patch.
+
+---
 
 ## License
 
