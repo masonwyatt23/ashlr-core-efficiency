@@ -141,7 +141,7 @@ export function read(opts: ReadOptions = {}): SessionLogEntry[] {
     return [];
   }
 
-  const lines = raw.split("\n");
+  const lines = raw.split(/\r?\n/);
   const out: SessionLogEntry[] = [];
 
   // Walk bottom-up so we can short-circuit on `limit`.
@@ -237,7 +237,7 @@ export async function* tail(
       const slice = readSlice(path, offset, size);
       offset = size;
 
-      for (const line of slice.split("\n")) {
+      for (const line of slice.split(/\r?\n/)) {
         if (!line) continue;
         let entry: SessionLogEntry;
         try {

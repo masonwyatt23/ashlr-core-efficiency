@@ -10,7 +10,7 @@
 
 import { existsSync } from "fs";
 import { writeFile } from "fs/promises";
-import { join } from "path";
+import { join, sep } from "path";
 import type { LLMSummarizer } from "../types/index.ts";
 import { appendJsonl, readJsonl } from "./jsonl.ts";
 import { genomeDir, readSection, writeSection } from "./manifest.ts";
@@ -195,8 +195,13 @@ async function writeSectionFromProposal(
   content: string,
   proposal: GenomeProposal,
 ): Promise<void> {
-  // Derive title and tags from section path
-  const parts = sectionPath.replace(".md", "").split("/");
+  // Derive title and tags from section path.
+  // Use the platform separator because on Windows `join` produces "\" paths
+  // and split("/") would yield a single element containing the full path.
+  // Normalize away any forward-slashes a caller might pass (POSIX-style section
+  // paths stored in the manifest) so both "/" and sep work correctly.
+  const normalized = sectionPath.replace(/\//g, sep);
+  const parts = normalized.replace(".md", "").split(sep);
   const title = parts[parts.length - 1]!.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
   const category = parts[0] ?? "other";
 

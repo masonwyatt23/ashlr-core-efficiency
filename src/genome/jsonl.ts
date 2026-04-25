@@ -29,7 +29,7 @@ export async function readJsonl<T>(path: string): Promise<T[]> {
   if (!existsSync(path)) return [];
   const raw = await readFile(path, "utf-8");
   const results: T[] = [];
-  for (const line of raw.split("\n")) {
+  for (const line of raw.split(/\r?\n/)) {
     if (!line.trim()) continue;
     try {
       results.push(JSON.parse(line) as T);

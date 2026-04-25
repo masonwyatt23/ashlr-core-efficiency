@@ -11,7 +11,7 @@
  */
 
 import { existsSync } from "fs";
-import { dirname, resolve } from "path";
+import { dirname, join, resolve } from "path";
 import { formatGenomeForPrompt, retrieveSectionsV2 } from "../genome/retriever.ts";
 
 const DEFAULT_MAX_TOKENS = 2000;
@@ -45,7 +45,7 @@ function findGenomeRoot(start: string): string | undefined {
   // Cap the walk at 20 hops to guard against pathological setups; in
   // practice genome should be at most a handful of levels up.
   for (let i = 0; i < 20; i++) {
-    if (existsSync(`${dir}/.ashlrcode/genome`)) return dir;
+    if (existsSync(join(dir, ".ashlrcode", "genome"))) return dir;
     const parent = dirname(dir);
     if (parent === dir) return undefined;
     dir = parent;
@@ -79,7 +79,7 @@ export async function withGenome(
   const query = opts.query ?? "";
   const walkUp = opts.walkUp ?? true;
 
-  const root = walkUp ? findGenomeRoot(cwd) : existsSync(`${cwd}/.ashlrcode/genome`) ? cwd : undefined;
+  const root = walkUp ? findGenomeRoot(cwd) : existsSync(join(cwd, ".ashlrcode", "genome")) ? cwd : undefined;
   if (!root) return systemPrompt;
 
   let sections;

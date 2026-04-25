@@ -11,6 +11,7 @@
  * without needing to re-read files that would blow the 32K context.
  */
 
+import { sep } from "node:path";
 import { read } from "../session-log/index.ts";
 import type { SessionLogEntry } from "../session-log/types.ts";
 import { retrieveSectionsV2, formatGenomeForPrompt } from "../genome/retriever.ts";
@@ -108,10 +109,14 @@ function deriveSessionSummary(entries: SessionLogEntry[], cwd: string): string {
 
 /**
  * Shorten an absolute path for display — keep last 2 segments.
+ * Normalises both forward-slash (POSIX) and backslash (Windows) separators
+ * so the split works correctly on all platforms.
  */
 function shortPath(p: string): string {
-  const segments = p.split("/");
+  // Normalise to platform sep, then split.
+  const normalised = p.replace(/[\\/]/g, sep);
+  const segments = normalised.split(sep);
   return segments.length > 2
-    ? segments.slice(-2).join("/")
+    ? segments.slice(-2).join(sep)
     : p;
 }

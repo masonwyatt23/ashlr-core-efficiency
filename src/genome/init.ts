@@ -280,7 +280,7 @@ function parseClaudeMdSections(content: string): {
   commands?: string;
   principles?: string[];
 } {
-  const lines = content.split("\n");
+  const lines = content.split(/\r?\n/);
   const result: ReturnType<typeof parseClaudeMdSections> = {};
 
   // First non-empty, non-header line is likely the description

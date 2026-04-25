@@ -55,6 +55,8 @@ function blockCharCount(block: ContentBlock): number {
       return block.content.length;
     case "image_url":
       return 1000; // ~1000 tokens per image
+    default:
+      return 0;
   }
 }
 
@@ -189,6 +191,8 @@ function blockTokenCount(enc: Encoder, block: ContentBlock): number {
       return encodedLength(enc, block.content);
     case "image_url":
       return 1000;
+    default:
+      return 0;
   }
 }
 

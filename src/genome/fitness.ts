@@ -158,7 +158,7 @@ async function countMarkersRecursive(dir: string, callback: (lines: number, mark
       await countMarkersRecursive(fullPath, callback);
     } else if (entry.isFile() && /\.(ts|tsx|js|jsx)$/.test(entry.name)) {
       const content = await readFile(fullPath, "utf-8");
-      const lines = content.split("\n").length;
+      const lines = content.split(/\r?\n/).length;
       const markers = (content.match(/\b(TODO|FIXME|HACK|XXX)\b/gi) ?? []).length;
       callback(lines, markers);
     }
