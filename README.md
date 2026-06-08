@@ -101,11 +101,22 @@ import {
   genomeExists,
 } from "@ashlr/core-efficiency/genome";
 
-if (await genomeExists(process.cwd())) {
-  const sections = await retrieveSectionsV2("architecture overview", process.cwd(), {
-    maxTokens: 2000,
-  });
-  const system = injectGenomeContext(baseSystem, sections);
+if (genomeExists(process.cwd())) {
+  // retrieveSectionsV2(cwd, query, maxTokens) → relevant sections within budget.
+  const sections = await retrieveSectionsV2(
+    process.cwd(),
+    "architecture overview",
+    2000,
+  );
+
+  // Or inject directly into a prompt builder:
+  // injectGenomeContext(builder, cwd, taskDescription, maxTokens) → tokens added.
+  const added = await injectGenomeContext(
+    builder,
+    process.cwd(),
+    "architecture overview",
+    2000,
+  );
 }
 ```
 
@@ -146,20 +157,49 @@ See [`examples/anthropic-sdk/`](./examples/anthropic-sdk/) for runnable scenario
 ### session-log
 
 ```typescript
-import { SessionLog } from "@ashlr/core-efficiency/session-log";
+import { append, read, tail, rotate } from "@ashlr/core-efficiency/session-log";
 
-const log = new SessionLog();
-log.record({ type: "tool_call", tool: "ashlr__read", inputTokens: 120 });
-console.log(log.summary());
+// Append one entry (ts is auto-filled if omitted).
+await append({
+  agent: "claude-code",
+  event: "tool_call",
+  tool: "ashlr__read",
+  meta: { inputTokens: 120 },
+});
+
+// Read the most recent entries (most-recent-first).
+const recent = read({ limit: 10 });
+
+// Follow new entries as they're appended (async iterator).
+for await (const entry of tail({ agent: "claude-code" })) {
+  console.log(entry.event, entry.tool);
+  break;
+}
+
+// Force a rotation (renames the log to <path>.1 and starts fresh).
+rotate();
 ```
 
 ### local
 
 ```typescript
-import { LocalContextManager } from "@ashlr/core-efficiency/local";
+import { LocalContextWindow, buildResumeContext } from "@ashlr/core-efficiency/local";
 
-const mgr = new LocalContextManager({ contextWindow: 4096 });
-const messages = mgr.fit(allMessages);  // drops oldest turns to stay within window
+// Configure for a small-context model (e.g. a 32K model with 4K reserved).
+const ctx = new LocalContextWindow({ maxTokens: 28_000, compactThreshold: 0.75 });
+
+// Add messages; add() returns false once compaction is needed.
+for (const message of allMessages) {
+  if (!ctx.add(message)) {
+    await ctx.compact(summarizer);  // summarizer optional; tiers snip/collapse first
+  }
+}
+
+const messages = ctx.getMessages();  // messages ready for the next LLM call
+console.log(ctx.stats());            // { totalTokens, used, utilization, messageCount, compactions }
+
+// Rebuild a compact orientation block when resuming a session.
+const resume = await buildResumeContext(process.cwd());
 ```
 
 Root barrel export (all subpaths re-exported):
