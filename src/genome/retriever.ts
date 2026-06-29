@@ -162,6 +162,14 @@ export interface RetrievedSection {
   content: string;
   tokens: number;
   score: number;
+  /**
+   * Cross-referenced section paths discovered during graph traversal.
+   * Populated by `buildAndTraverseGraph` when a section mentions "See X"
+   * or similar patterns in its metadata. The weaver can use these to
+   * chain further retrieval for richer context.
+   * Only present on sections returned by graph-traversal-based retrieval.
+   */
+  relatedSectionPaths?: string[];
 }
 
 /**
