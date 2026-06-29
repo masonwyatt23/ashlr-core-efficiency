@@ -10,6 +10,8 @@ import { readdir, readFile } from "fs/promises";
 import { join } from "path";
 import { loadManifest, readSection } from "./manifest.ts";
 import { loadMutationsForGeneration } from "./scribe.ts";
+export { measureFitnessEmpirical, FitnessCalibrator, InstrumentedFitness } from "./fitness-hooks.ts";
+export type { FitnessInstrument, FitnessEvent, FitnessEventKind, TestRunEvent, ChangeEvent, StrategyEvent, CalibrationReport } from "./fitness-hooks.ts";
 
 // ---------------------------------------------------------------------------
 // Types

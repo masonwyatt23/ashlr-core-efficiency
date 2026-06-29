@@ -12,6 +12,7 @@
 
 export * from "./embeddings.ts";
 export * from "./fitness.ts";
+export * from "./fitness-hooks.ts";
 export * from "./generations.ts";
 export * from "./init.ts";
 export * from "./jsonl.ts";

@@ -94,3 +94,9 @@ export interface ProviderRequest {
 export interface LLMSummarizer {
   stream(request: ProviderRequest): AsyncGenerator<StreamEvent>;
 }
+
+/**
+ * Re-export FitnessInstrument so consumers of @ashlr/core-efficiency can
+ * type-check their instrumentation without importing from the genome subpath.
+ */
+export type { FitnessInstrument, FitnessEvent, FitnessEventKind } from "../genome/fitness-hooks.ts";
