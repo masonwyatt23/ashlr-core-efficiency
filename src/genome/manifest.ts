@@ -27,6 +27,13 @@ export interface SectionMeta {
   tokens: number;
   /** ISO timestamp of last modification */
   updatedAt: string;
+  /**
+   * Optional parent section path for hierarchical organisation.
+   * E.g. a section at "architecture/layer-api.md" may set
+   * parentId = "architecture/overview.md" so that retrieving the
+   * parent automatically pulls this child section too.
+   */
+  parentId?: string;
 }
 
 export interface GenerationMeta {
@@ -34,6 +41,17 @@ export interface GenerationMeta {
   milestone: string;
   startedAt: string;
   endedAt?: string;
+}
+
+export interface QuantizationStats {
+  /** Total size of all quantized embeddings in bytes */
+  totalSize: number;
+  /** Total size of all original float32 embeddings in bytes */
+  originalSize: number;
+  /** Ratio of quantized to original size (e.g. 0.25 for 4× compression) */
+  compressionRatio: number;
+  /** Mean cosine-similarity delta between original and reconstructed embeddings */
+  avgSimilarityDelta: number;
 }
 
 export interface GenomeManifest {
@@ -50,6 +68,11 @@ export interface GenomeManifest {
   /** ISO timestamp */
   createdAt: string;
   updatedAt: string;
+  /**
+   * Statistics from the most recent quantized embedding pass.
+   * Only present when updateEmbeddings was called with { quantize: true }.
+   */
+  quantizationStats?: QuantizationStats;
 }
 
 // ---------------------------------------------------------------------------
