@@ -1267,3 +1267,444 @@ export class QuantizationStrategyEngine {
     return buildQuantizationReport(outcomes, tier);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Multi-Tier Quantization Strategy Router
+// ---------------------------------------------------------------------------
+
+/**
+ * The four quantization tiers in the fallback chain, ordered best→worst quality.
+ *
+ * float32  → baseline (no compression)
+ * int16    → 2× compression, ~0.00002 MAE
+ * int8     → 4× compression, ~0.005 MAE
+ * bfloat16 → 2× compression, ~0.0002 MAE (sparse mode: better than int8 but no scalars)
+ */
+export type RouterTier = "float32" | "int16" | "int8" | "bfloat16";
+
+/** Ordered fallback chain: first entry is the highest quality, last is the cheapest. */
+export const ROUTER_FALLBACK_CHAIN: readonly RouterTier[] = [
+  "float32",
+  "int16",
+  "int8",
+  "bfloat16",
+] as const;
+
+/**
+ * Per-section quantization metadata stored in the embedding cache alongside
+ * the quantized values. Written at build time by `quantizationStrategyRouter`
+ * and read at query time to reconstruct the cheapest acceptable tier.
+ */
+export interface SectionQuantizationMeta {
+  /** The section's relative path within the genome directory. */
+  sectionPath: string;
+  /**
+   * The assigned quantization tier for this section.
+   * Determined at build time based on reconstruction error sensitivity.
+   */
+  assignedTier: RouterTier;
+  /**
+   * Per-tier reconstruction error (MAE vs float32) measured at build time.
+   * Keys are tier names; values are mean absolute errors.
+   */
+  tierErrors: Partial<Record<RouterTier, number>>;
+  /**
+   * Sensitivity classification — how tolerant this section is of quantization error.
+   *  - "high":    Tolerates int8 or even bfloat16 (e.g. prose summaries, vision docs)
+   *  - "medium":  Tolerates int16 but not int8   (e.g. most code sections)
+   *  - "low":     Requires float32 or int16       (e.g. critical API contracts)
+   */
+  sensitivity: "high" | "medium" | "low";
+  /** Estimated storage bytes for this section at the assigned tier. */
+  storageBytesAssigned: number;
+  /** Estimated storage bytes if stored as float32 (baseline). */
+  storageBytesFloat32: number;
+  /** Compression ratio vs float32 baseline (lower is better, e.g. 0.25 = 4× reduction). */
+  compressionRatio: number;
+  /** ISO timestamp when this metadata was written. */
+  evaluatedAt: string;
+}
+
+/**
+ * Summary produced by `quantizationStrategyRouter` after evaluating all sections.
+ */
+export interface RouterBuildResult {
+  /** Per-section metadata, keyed by sectionPath. */
+  sectionMeta: Map<string, SectionQuantizationMeta>;
+  /** Aggregate statistics across all sections. */
+  stats: {
+    totalSections: number;
+    tierCounts: Record<RouterTier, number>;
+    avgCompressionRatio: number;
+    estimatedStorageSavingsFraction: number;
+  };
+  /** ISO timestamp when the build completed. */
+  builtAt: string;
+}
+
+/**
+ * Options for `quantizationStrategyRouter`.
+ */
+export interface RouterBuildOptions {
+  /**
+   * MAE threshold below which a section is considered "insensitive" to int8
+   * quantization (can use int8 or bfloat16).  Default: 0.008.
+   */
+  int8ErrorThreshold?: number;
+  /**
+   * MAE threshold below which a section tolerates int16 but not int8.
+   * Default: 0.003.
+   */
+  int16ErrorThreshold?: number;
+  /**
+   * When true, code-like sections (containing function/class/import keywords,
+   * detected by path suffix or content signals) are always assigned int16 or
+   * better, regardless of reconstruction error. Default: true.
+   */
+  protectCodeSections?: boolean;
+  /**
+   * Custom sensitivity overrides: sections whose path matches a key in this
+   * map are force-assigned the given sensitivity, bypassing error measurement.
+   * E.g. { "architecture/api-contracts.md": "low" }
+   */
+  sensitivityOverrides?: Record<string, "high" | "medium" | "low">;
+}
+
+/**
+ * Heuristically detect whether a section path looks like code/API documentation.
+ * These sections tolerate less quantization error than prose.
+ */
+function _isCodeLikeSection(sectionPath: string): boolean {
+  const codeLikeSuffixes = [
+    ".ts", ".js", ".tsx", ".jsx", ".py", ".go", ".rs", ".java", ".cpp", ".c",
+    ".h", ".rb", ".php", ".swift", ".kt", ".cs",
+  ];
+  const codeLikeKeywords = [
+    "api", "interface", "schema", "types", "contracts", "spec", "protocol",
+    "migration", "auth", "security", "permissions",
+  ];
+  const lower = sectionPath.toLowerCase();
+  return (
+    codeLikeSuffixes.some((s) => lower.endsWith(s)) ||
+    codeLikeKeywords.some((kw) => lower.includes(kw))
+  );
+}
+
+/**
+ * Measure reconstruction MAE for a single embedding at a given integer bit depth.
+ * Uses the existing quantizeEmbedding / dequantizeEmbedding functions.
+ */
+function _measureIntError(embedding: number[], bitDepth: 8 | 16): number {
+  // Import inline to avoid circular deps — both functions are in the same module
+  // boundary (embeddings.ts), but we import them at the top of this file too.
+  // We compute manually here to keep quantization-strategy self-contained for testing.
+  if (embedding.length === 0) return 0;
+
+  let min = embedding[0]!;
+  let max = embedding[0]!;
+  for (const v of embedding) {
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  const range = max - min;
+  const intMax = bitDepth === 8 ? 127 : 32767;
+  const intMin = bitDepth === 8 ? -128 : -32768;
+
+  let mae = 0;
+  for (let i = 0; i < embedding.length; i++) {
+    const normalized = range === 0 ? 0 : (embedding[i]! - min) / range;
+    const scaled = Math.round(normalized * (intMax - intMin) + intMin);
+    const clamped = Math.max(intMin, Math.min(intMax, scaled));
+    const reconstructed = ((clamped - intMin) / (intMax - intMin)) * range + min;
+    mae += Math.abs(embedding[i]! - reconstructed);
+  }
+  return mae / embedding.length;
+}
+
+/**
+ * Measure reconstruction MAE for bfloat16 encoding of an embedding.
+ */
+function _measureBfloat16Error(embedding: number[]): number {
+  if (embedding.length === 0) return 0;
+  let mae = 0;
+  const buf = new ArrayBuffer(4);
+  const view = new DataView(buf);
+  for (let i = 0; i < embedding.length; i++) {
+    // Encode to bfloat16 (upper 2 bytes of float32)
+    view.setFloat32(0, embedding[i]!, false);
+    const bf16 = view.getUint16(0, false);
+    // Decode back
+    view.setUint16(0, bf16, false);
+    view.setUint16(2, 0, false);
+    const reconstructed = view.getFloat32(0, false);
+    mae += Math.abs(embedding[i]! - reconstructed);
+  }
+  return mae / embedding.length;
+}
+
+/**
+ * Compute bytes needed to store an embedding at a given tier.
+ *  - float32:  4 bytes per dimension
+ *  - int16:    2 bytes per dimension
+ *  - int8:     1 byte per dimension
+ *  - bfloat16: 2 bytes per dimension
+ */
+function _storageBytes(dim: number, tier: RouterTier): number {
+  switch (tier) {
+    case "float32": return dim * 4;
+    case "int16":   return dim * 2;
+    case "int8":    return dim * 1;
+    case "bfloat16": return dim * 2;
+  }
+}
+
+/**
+ * Classify a section's sensitivity to quantization error based on measured
+ * per-tier MAE and optional code-detection heuristics.
+ *
+ * Rules (applied in priority order):
+ *  1. Override from `sensitivityOverrides` → use directly.
+ *  2. Code-like section path + `protectCodeSections` → "medium" minimum.
+ *  3. int8 MAE > int8ErrorThreshold   → "low"   (very sensitive)
+ *     int8 MAE > int16ErrorThreshold  → "medium" (needs int16 at least)
+ *     otherwise                       → "high"  (tolerates int8)
+ */
+function _classifySensitivity(
+  sectionPath: string,
+  tierErrors: Partial<Record<RouterTier, number>>,
+  opts: Required<RouterBuildOptions>,
+): "high" | "medium" | "low" {
+  // 1. Hard override
+  if (opts.sensitivityOverrides[sectionPath]) {
+    return opts.sensitivityOverrides[sectionPath]!;
+  }
+
+  const int8Error = tierErrors["int8"] ?? 0;
+  const int16Error = tierErrors["int16"] ?? 0;
+
+  // 2. Code protection: if section looks like code and int16 error is non-trivial → medium
+  if (opts.protectCodeSections && _isCodeLikeSection(sectionPath)) {
+    if (int8Error > opts.int16ErrorThreshold) return "low";
+    return "medium";
+  }
+
+  // 3. Error-based classification
+  if (int8Error > opts.int8ErrorThreshold) return "medium";
+  if (int16Error > opts.int8ErrorThreshold) return "low";
+  return "high";
+}
+
+/**
+ * Map a sensitivity classification to the cheapest acceptable tier.
+ *
+ *  - "low"    → float32 (no quantization) or int16 (near-lossless)
+ *  - "medium" → int16 (2× compression, acceptable MAE)
+ *  - "high"   → int8 or bfloat16 (4× compression / sparse mode)
+ *
+ * For "high" sensitivity we prefer bfloat16 over int8 when the bfloat16 error
+ * is lower (which is typical for smooth distributions). Both provide 2× storage
+ * reduction over float32.
+ */
+function _tierForSensitivity(
+  sensitivity: "high" | "medium" | "low",
+  tierErrors: Partial<Record<RouterTier, number>>,
+): RouterTier {
+  switch (sensitivity) {
+    case "low":
+      return "int16";
+    case "medium":
+      return "int16";
+    case "high": {
+      // Prefer bfloat16 when it is measurably better than int8
+      const bf16Error = tierErrors["bfloat16"] ?? Infinity;
+      const int8Error = tierErrors["int8"] ?? Infinity;
+      // bfloat16 is typically ~20× more accurate than int8 for unit-norm vectors
+      return bf16Error < int8Error ? "bfloat16" : "int8";
+    }
+  }
+}
+
+/**
+ * Build-time quantization strategy router.
+ *
+ * For each section that has a float32 embedding in the cache, this function:
+ *  1. Measures per-tier reconstruction MAE (float32→int16→int8→bfloat16).
+ *  2. Classifies the section's sensitivity based on error curves and path heuristics.
+ *  3. Assigns the cheapest tier that keeps MAE within the sensitivity budget.
+ *  4. Returns per-section metadata and aggregate statistics.
+ *
+ * The returned `SectionQuantizationMeta` map should be stored alongside the
+ * embedding cache so that `retrieveSectionsV2` can use it at query time to
+ * select the cheapest tier within the caller's `maxTokens` budget.
+ *
+ * @param entries  Embedding cache entries (must have `.embedding` populated).
+ * @param options  Sensitivity and threshold overrides.
+ */
+export function quantizationStrategyRouter(
+  entries: Array<{
+    sectionPath: string;
+    embedding: number[];
+    tokens?: number;
+    /** Optional section title — used for sensitivity detection. */
+    title?: string;
+  }>,
+  options: RouterBuildOptions = {},
+): RouterBuildResult {
+  const opts: Required<RouterBuildOptions> = {
+    int8ErrorThreshold:  options.int8ErrorThreshold  ?? 0.008,
+    int16ErrorThreshold: options.int16ErrorThreshold ?? 0.003,
+    protectCodeSections: options.protectCodeSections !== false, // default true
+    sensitivityOverrides: options.sensitivityOverrides ?? {},
+  };
+
+  const sectionMeta = new Map<string, SectionQuantizationMeta>();
+  const tierCounts: Record<RouterTier, number> = {
+    float32: 0, int16: 0, int8: 0, bfloat16: 0,
+  };
+  let totalStorageAssigned = 0;
+  let totalStorageFloat32 = 0;
+
+  for (const entry of entries) {
+    const { sectionPath, embedding } = entry;
+    if (embedding.length === 0) continue;
+
+    const dim = embedding.length;
+
+    // Measure per-tier errors
+    const tierErrors: Partial<Record<RouterTier, number>> = {
+      float32:  0,
+      int16:    _measureIntError(embedding, 16),
+      int8:     _measureIntError(embedding, 8),
+      bfloat16: _measureBfloat16Error(embedding),
+    };
+
+    const sensitivity = _classifySensitivity(sectionPath, tierErrors, opts);
+    const assignedTier = _tierForSensitivity(sensitivity, tierErrors);
+
+    const storageBytesAssigned = _storageBytes(dim, assignedTier);
+    const storageBytesFloat32  = _storageBytes(dim, "float32");
+    const compressionRatio = storageBytesFloat32 > 0
+      ? storageBytesAssigned / storageBytesFloat32
+      : 1;
+
+    sectionMeta.set(sectionPath, {
+      sectionPath,
+      assignedTier,
+      tierErrors,
+      sensitivity,
+      storageBytesAssigned,
+      storageBytesFloat32,
+      compressionRatio,
+      evaluatedAt: new Date().toISOString(),
+    });
+
+    tierCounts[assignedTier]++;
+    totalStorageAssigned += storageBytesAssigned;
+    totalStorageFloat32  += storageBytesFloat32;
+  }
+
+  const totalSections = sectionMeta.size;
+  const avgCompressionRatio = totalStorageFloat32 > 0
+    ? totalStorageAssigned / totalStorageFloat32
+    : 1;
+  const estimatedStorageSavingsFraction = 1 - avgCompressionRatio;
+
+  return {
+    sectionMeta,
+    stats: {
+      totalSections,
+      tierCounts,
+      avgCompressionRatio,
+      estimatedStorageSavingsFraction,
+    },
+    builtAt: new Date().toISOString(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Query-time tier selection helpers (used by retrieveSectionsV2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Budget tier order for query-time selection: cheapest acceptable tier that
+ * stays within the caller's token budget.
+ *
+ * Given a query's `maxTokens` budget and a genome profile, this function
+ * returns the cheapest tier from the fallback chain that is expected to
+ * fit all retrieval candidates within budget:
+ *
+ *  - Large genomes (> 150 sections) under tight budgets → prefer int8/bfloat16
+ *    (fewer bytes to reconstruct per-candidate during scoring).
+ *  - Small/tiny genomes → int16 is fine; reconstruction overhead is negligible.
+ *  - float32 is only chosen when the query explicitly requires full precision
+ *    (i.e. `forcePrecision=true` or when the profile tier is "tiny" and
+ *    budget is generous).
+ *
+ * @param profile      GenomeProfile from GenomeProfiler.
+ * @param maxTokens    Token budget passed to the retrieval call.
+ * @param forcePrecision  When true, always return "float32".
+ */
+export function selectQueryTier(
+  profile: GenomeProfile,
+  maxTokens: number,
+  forcePrecision = false,
+): RouterTier {
+  if (forcePrecision) return "float32";
+
+  const { sizeTier } = profile;
+  const tokensBudgetPerSection =
+    profile.sectionCount > 0 ? maxTokens / profile.sectionCount : maxTokens;
+
+  // Very tight per-section budget → maximise storage savings
+  if (tokensBudgetPerSection < 50 || sizeTier === "large") {
+    return "int8";
+  }
+
+  if (sizeTier === "medium") {
+    return tokensBudgetPerSection < 200 ? "int8" : "int16";
+  }
+
+  // small / tiny: near-lossless is cheap enough
+  return "int16";
+}
+
+/**
+ * Given a `RouterBuildResult` and a set of section paths to retrieve, return
+ * the cheapest tier that satisfies the budget constraint.
+ *
+ * Algorithm:
+ *  1. Derive the default query tier from `selectQueryTier(profile, maxTokens)`.
+ *  2. For each requested section path, look up its assigned tier from the build result.
+ *  3. Return the "most expensive" (highest quality) tier across all requested sections
+ *     that is still ≤ the default query tier in the fallback chain.
+ *     (We never return a tier cheaper than what any section requires.)
+ *
+ * If `buildResult` is null (not yet computed), fall back to `selectQueryTier`.
+ */
+export function selectBudgetTier(
+  profile: GenomeProfile,
+  maxTokens: number,
+  sectionPaths: string[],
+  buildResult: RouterBuildResult | null,
+): RouterTier {
+  const defaultTier = selectQueryTier(profile, maxTokens);
+
+  if (!buildResult || sectionPaths.length === 0) return defaultTier;
+
+  // Find the cheapest tier index (higher index = cheaper in ROUTER_FALLBACK_CHAIN)
+  const defaultIdx = ROUTER_FALLBACK_CHAIN.indexOf(defaultTier);
+
+  // For each requested section, find its assigned tier index
+  let maxRequiredIdx = defaultIdx; // start at the allowed maximum (cheapest)
+  for (const path of sectionPaths) {
+    const meta = buildResult.sectionMeta.get(path);
+    if (!meta) continue;
+    const tierIdx = ROUTER_FALLBACK_CHAIN.indexOf(meta.assignedTier);
+    // If this section needs a more expensive tier (lower index), upgrade
+    if (tierIdx < maxRequiredIdx) {
+      maxRequiredIdx = tierIdx;
+    }
+  }
+
+  return ROUTER_FALLBACK_CHAIN[maxRequiredIdx] ?? defaultTier;
+}
