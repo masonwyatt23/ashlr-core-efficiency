@@ -21,7 +21,13 @@
 import { appendJsonl, readJsonl } from "./jsonl.ts";
 import { genomeDir } from "./manifest.ts";
 import { generateEmbedding, isOllamaAvailable } from "./embeddings.ts";
+import { UltraFastEmbedder, type UltraFastAuditRecord, ULTRAFAST_EMBEDDING_DIM } from "./embedding-ultrafast.ts";
 import { join } from "path";
+import {
+  QuantizationStrategyEngine,
+  type QuantizationBitDepth,
+  type GenomeProfile,
+} from "./quantization-strategy.ts";
 
 // ---------------------------------------------------------------------------
 // Model registry
@@ -31,9 +37,10 @@ import { join } from "path";
 export type EmbeddingModelName =
   | "nomic-embed-text"
   | "all-minilm-l6-v2"
-  | "bge-base-en-v1-5";
+  | "bge-base-en-v1-5"
+  | "ultrafast";
 
-export type ModelTier = "fast" | "balanced" | "accurate";
+export type ModelTier = "fast" | "balanced" | "accurate" | "ultrafast";
 
 export interface EmbeddingModelSpec {
   name: EmbeddingModelName;
@@ -53,7 +60,7 @@ export interface EmbeddingModelSpec {
   timeoutMs: number;
 }
 
-/** Registry of all known embedding models, ordered fast → accurate. */
+/** Registry of all known embedding models, ordered fast → accurate → ultrafast. */
 export const EMBEDDING_MODELS: Record<EmbeddingModelName, EmbeddingModelSpec> = {
   "all-minilm-l6-v2": {
     name: "all-minilm-l6-v2",
@@ -76,13 +83,21 @@ export const EMBEDDING_MODELS: Record<EmbeddingModelName, EmbeddingModelSpec> = 
     nominalLatencyMs: 30,
     timeoutMs: 20_000,
   },
+  "ultrafast": {
+    name: "ultrafast",
+    tier: "ultrafast",
+    dimension: ULTRAFAST_EMBEDDING_DIM,
+    nominalLatencyMs: 0,
+    timeoutMs: 100, // hard cap — should always be sub-ms
+  },
 };
 
-/** Fallback cascade order (index 0 = first try). */
+/** Fallback cascade order (index 0 = first try). ultrafast is always last. */
 const CASCADE_ORDER: EmbeddingModelName[] = [
   "bge-base-en-v1-5",
   "nomic-embed-text",
   "all-minilm-l6-v2",
+  "ultrafast",
 ];
 
 // ---------------------------------------------------------------------------
@@ -105,6 +120,16 @@ export interface ModelOutcomeRecord {
   /** Caller-supplied quality signal: 1.0 = perfect, 0.0 = useless. null = not yet rated. */
   matchQuality: number | null;
   timestamp: string;
+  /**
+   * Number of Ollama tiers that timed out before this model was selected.
+   * Non-zero only for ultrafast tier records; signals Ollama flakiness.
+   */
+  ollamaTimeouts?: number;
+  /**
+   * True when this record represents an ultrafast-tier fallback (no Ollama).
+   * Used by fitness-hooks to track ultrafast adoption rates.
+   */
+  isUltrafastFallback?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -314,44 +339,81 @@ export interface EmbeddingResult {
   latencyMs: number;
   /** True if a fallback model was used (primary timed out). */
   usedFallback: boolean;
+  /** True when the ultrafast (no-ML) tier was used as the final fallback. */
+  usedUltrafast?: boolean;
+  /** Number of Ollama tiers that timed out before this result was produced. */
+  ollamaTimeouts?: number;
+  /**
+   * Quantization bit-depth selected by the QuantizationStrategyEngine for this query.
+   * Present when the router has a strategy engine configured.
+   * Callers should pass this to QuantizedANNSearcher.search() as overrideBitDepth.
+   */
+  selectedQuantizationDepth?: QuantizationBitDepth;
+  /**
+   * Outcome ID from the QuantizationStrategyEngine, for recording actual performance
+   * after the search completes via engine.recordOutcome().
+   */
+  quantizationOutcomeId?: string;
 }
 
 /**
  * Generate an embedding with automatic fallback cascade.
  *
  * Tries the `primaryModel` first; if it times out or fails, tries each
- * subsequent model in `CASCADE_ORDER` (from accurate → fast).  Returns null
- * only when all cascade models are exhausted.
+ * subsequent model in `CASCADE_ORDER` (accurate → balanced → fast →
+ * ultrafast).  The ultrafast tier never fails — it always returns a
+ * deterministic hash-based embedding without calling Ollama.
  *
  * Timeout per model is taken from `EmbeddingModelSpec.timeoutMs`.
+ *
+ * Returns null only when the primary is "ultrafast" and the text is empty
+ * (degenerate case). In all other cases a result is guaranteed.
  */
 export async function generateEmbeddingWithFallback(
   text: string,
   primaryModel: EmbeddingModelName,
 ): Promise<EmbeddingResult | null> {
   // Build the attempt order: primary first, then the rest of the cascade
-  // (skipping the primary to avoid duplicates).
+  // (skipping the primary to avoid duplicates). ultrafast is always last.
+  const ollamaModels: EmbeddingModelName[] = CASCADE_ORDER.filter(
+    (m) => m !== "ultrafast" && m !== primaryModel,
+  );
   const attemptOrder: EmbeddingModelName[] = [
     primaryModel,
-    ...CASCADE_ORDER.filter((m) => m !== primaryModel),
+    ...ollamaModels,
+    // ultrafast last (only if not already primary)
+    ...(primaryModel === "ultrafast" ? [] : ["ultrafast" as EmbeddingModelName]),
   ];
 
   const overallStart = Date.now();
+  let ollamaTimeouts = 0;
 
   for (let i = 0; i < attemptOrder.length; i++) {
     const modelName = attemptOrder[i]!;
-    const spec = EMBEDDING_MODELS[modelName];
-    const modelStart = Date.now();
 
-    // generateEmbedding already has its own timeout; we honour the per-model
-    // spec timeout by wrapping in a race.
+    // ── ultrafast tier — no Ollama, always succeeds ──────────────────────
+    if (modelName === "ultrafast") {
+      const embedder = new UltraFastEmbedder();
+      const embedding = embedder.embed(text);
+      return {
+        embedding,
+        modelName: "ultrafast",
+        latencyMs: Date.now() - overallStart,
+        usedFallback: i > 0,
+        usedUltrafast: true,
+        ollamaTimeouts,
+      };
+    }
+
+    // ── Ollama-backed tiers ───────────────────────────────────────────────
+    const spec = EMBEDDING_MODELS[modelName];
+
     const embeddingPromise = generateEmbedding(text, modelName);
     const timeoutPromise = new Promise<null>((resolve) =>
       setTimeout(() => resolve(null), spec.timeoutMs),
     );
 
     const embedding = await Promise.race([embeddingPromise, timeoutPromise]);
-    const modelLatency = Date.now() - modelStart;
 
     if (embedding !== null) {
       return {
@@ -359,13 +421,15 @@ export async function generateEmbeddingWithFallback(
         modelName,
         latencyMs: Date.now() - overallStart,
         usedFallback: i > 0,
+        ...(ollamaTimeouts > 0 ? { ollamaTimeouts } : {}),
       };
     }
 
-    // Model failed or timed out — try the next one
-    void modelLatency; // latency tracked by caller via overall latency
+    // Model failed or timed out — count and try next
+    ollamaTimeouts++;
   }
 
+  // Should never be reached: ultrafast always succeeds
   return null;
 }
 
@@ -379,6 +443,12 @@ export interface EmbeddingRouterOptions extends ModelSelectionOptions {
    * Useful in tests.
    */
   cwd?: string;
+  /**
+   * When true, the router integrates a QuantizationStrategyEngine to select
+   * the best quantization bit-depth before model tier selection.
+   * Defaults to false to preserve backward compatibility.
+   */
+  enableQuantizationStrategy?: boolean;
 }
 
 /**
@@ -396,6 +466,7 @@ export interface EmbeddingRouterOptions extends ModelSelectionOptions {
 export class EmbeddingRouter {
   private readonly cwd: string;
   private readonly options: Required<ModelSelectionOptions>;
+  private readonly strategyEngine: QuantizationStrategyEngine | null;
 
   constructor(cwd: string, options: EmbeddingRouterOptions = {}) {
     this.cwd = cwd;
@@ -404,11 +475,28 @@ export class EmbeddingRouter {
       latencyBudgetMs: options.latencyBudgetMs ?? 3_000,
       minOutcomesForLearning: options.minOutcomesForLearning ?? 4,
     };
+    this.strategyEngine = options.enableQuantizationStrategy
+      ? new QuantizationStrategyEngine(cwd)
+      : null;
+  }
+
+  /**
+   * Load a genome manifest into the quantization strategy engine (if enabled).
+   * Call after loading/reloading the manifest so the engine has an up-to-date
+   * GenomeProfile for tier-aware bit-depth selection.
+   */
+  loadManifestProfile(manifest: import("./manifest.ts").GenomeManifest): GenomeProfile | null {
+    if (!this.strategyEngine) return null;
+    return this.strategyEngine.loadProfile(manifest);
   }
 
   /**
    * Generate an embedding for `text`, routing to the best model for the
    * query's complexity.  Records the outcome automatically.
+   *
+   * When `enableQuantizationStrategy` is true, also selects the optimal
+   * quantization bit-depth and attaches it to the result as
+   * `selectedQuantizationDepth` + `quantizationOutcomeId`.
    *
    * Returns null when Ollama is unavailable or the full cascade is exhausted.
    */
@@ -418,13 +506,24 @@ export class EmbeddingRouter {
   ): Promise<EmbeddingResult | null> {
     if (!(await isOllamaAvailable())) return null;
 
+    // ── Quantization strategy selection (before model tier choice) ────────
+    let selectedQuantizationDepth: QuantizationBitDepth | undefined;
+    let quantizationOutcomeId: string | undefined;
+
+    if (this.strategyEngine) {
+      const stratResult = await this.strategyEngine.selectBitDepth(query);
+      selectedQuantizationDepth = stratResult.bitDepth;
+      quantizationOutcomeId = stratResult.outcomeId;
+    }
+
+    // ── Model tier selection ──────────────────────────────────────────────
     const complexity = classifyQueryComplexity(query);
     const outcomes = await loadModelOutcomes(this.cwd);
     const primaryModel = selectEmbeddingModel(complexity, outcomes, this.options);
 
     const result = await generateEmbeddingWithFallback(text, primaryModel);
 
-    // Record the outcome for future learning
+    // Record the model outcome for future learning
     await recordModelOutcome(this.cwd, {
       modelName: result?.modelName ?? primaryModel,
       queryComplexity: complexity,
@@ -434,7 +533,13 @@ export class EmbeddingRouter {
       matchQuality: null, // Updated by caller via updateModelOutcomeQuality
     });
 
-    return result;
+    if (result === null) return null;
+
+    return {
+      ...result,
+      ...(selectedQuantizationDepth !== undefined ? { selectedQuantizationDepth } : {}),
+      ...(quantizationOutcomeId !== undefined ? { quantizationOutcomeId } : {}),
+    };
   }
 
   /**
