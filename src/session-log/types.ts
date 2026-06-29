@@ -54,6 +54,34 @@ export interface SessionLogEntry {
   meta?: Record<string, unknown>;
 }
 
+/**
+ * Optional outcome telemetry fields that can be attached to a session_end entry.
+ *
+ * Callers set these on a `session_end` event so the shared log carries enough
+ * context for `SessionOutcomeRecorder` to reconstruct the full trace without
+ * reading a separate file.
+ *
+ * All fields are optional so existing log writers are not broken.
+ */
+export interface SessionOutcomeMeta {
+  /** Genome generation number active during the session. */
+  genome_version?: number;
+  /** Compression tier active for the session (1–4). */
+  compression_tier?: 1 | 2 | 3 | 4;
+  /** Actual USD cost incurred. */
+  cost_actual?: number;
+  /** Budget (USD) the session was given. */
+  cost_budget?: number;
+  /** Cache savings realized (USD). */
+  cache_savings_usd?: number;
+  /** Actual wall-clock latency of the session (ms). */
+  latency_actual_ms?: number;
+  /** Latency SLA budget (ms). */
+  latency_budget_ms?: number;
+  /** Whether the test suite passed at session end. */
+  tests_passed?: boolean;
+}
+
 /** Options for {@link read}. */
 export interface ReadOptions {
   /** Cap on number of entries returned. Most-recent-first. */

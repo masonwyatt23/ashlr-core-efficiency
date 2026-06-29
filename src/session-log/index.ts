@@ -42,8 +42,28 @@ export type {
   KnownEvent,
   ReadOptions,
   SessionLogEntry,
+  SessionOutcomeMeta,
   TailOptions,
 } from "./types.ts";
+
+// Re-export session outcome recorder so callers can import everything from one place.
+export {
+  SessionOutcomeRecorder,
+  readSessionOutcomes,
+  computeFitnessSignalForGeneration,
+  updateGenomeFitness,
+  _resolveOutcomesPath,
+} from "./outcome-recorder.ts";
+
+export type {
+  OutcomeType,
+  SessionOutcomeRecord,
+  OutcomeEventBase,
+  TestOutcomeParams,
+  LatencyOutcomeParams,
+  CostOutcomeParams,
+  FitnessSignal,
+} from "./outcome-recorder.ts";
 
 // Re-export cost accounting so callers can import everything from one place.
 export {

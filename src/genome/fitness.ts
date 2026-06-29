@@ -10,6 +10,7 @@ import { readdir, readFile } from "fs/promises";
 import { join } from "path";
 import { loadManifest, readSection } from "./manifest.ts";
 import { loadMutationsForGeneration } from "./scribe.ts";
+import { computeFitnessSignalForGeneration } from "../session-log/outcome-recorder.ts";
 export { measureFitnessEmpirical, FitnessCalibrator, InstrumentedFitness } from "./fitness-hooks.ts";
 export type { FitnessInstrument, FitnessEvent, FitnessEventKind, TestRunEvent, ChangeEvent, StrategyEvent, CalibrationReport } from "./fitness-hooks.ts";
 
@@ -52,6 +53,51 @@ export async function measureFitness(cwd: string): Promise<FitnessMetrics> {
     milestoneProgress,
     costEfficiency,
     strategySuccessRate,
+  };
+}
+
+/**
+ * Measure fitness blending heuristic metrics with real outcome telemetry.
+ *
+ * When outcome records exist for the current generation, the three
+ * outcome-grounded rates override (or blend with) their heuristic counterparts:
+ *
+ * - `testsPassRate`      ← outcome `tests_passed_rate`      (if sample_count > 0)
+ * - `costEfficiency`     ← outcome `cost_compliance_rate`   (if sample_count > 0)
+ * - `strategySuccessRate`← outcome `latency_compliance_rate` (if sample_count > 0)
+ *
+ * When there are no outcome records yet (e.g. early in a generation), the
+ * function falls back to the pure heuristic `measureFitness()` result so
+ * callers always receive a well-formed `FitnessMetrics` object.
+ *
+ * @param cwd      Project root (same as passed to `measureFitness`).
+ * @param provider Provider slug for outcome lookup (default "unknown").
+ */
+export async function measureFitnessWithOutcomes(
+  cwd: string,
+  provider = "unknown",
+): Promise<FitnessMetrics> {
+  // Start heuristic and outcome computation in parallel.
+  const manifest = await loadManifest(cwd);
+  const genomeVersion = manifest?.generation.number ?? 0;
+
+  const [heuristic, signal] = await Promise.all([
+    measureFitness(cwd),
+    Promise.resolve(computeFitnessSignalForGeneration(cwd, genomeVersion, provider)),
+  ]);
+
+  // No outcome data yet — return pure heuristic.
+  if (signal.sample_count === 0) return heuristic;
+
+  // Blend: outcome signals are grounded in real execution; give them full
+  // authority when present. Heuristic values for `codeQuality` and
+  // `milestoneProgress` are unchanged since they have no outcome analogue.
+  return {
+    testsPassRate: signal.tests_passed_rate,
+    codeQuality: heuristic.codeQuality,
+    milestoneProgress: heuristic.milestoneProgress,
+    costEfficiency: signal.cost_compliance_rate,
+    strategySuccessRate: signal.latency_compliance_rate,
   };
 }
 
