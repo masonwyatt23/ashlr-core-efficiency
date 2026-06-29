@@ -539,22 +539,31 @@ export async function countTokensWithCache(
   let cacheWriteTokens = 0;
   let cacheReadTokens = 0;
 
-  for (const block of cacheBlocks) {
-    // Use the explicit token count when provided; otherwise fall back to
-    // estimating from the last message (conservative approximation).
-    const lastMsg = messages.length > 0 ? messages[messages.length - 1] : undefined;
-    const blockTokens =
-      block.created_token_count ??
-      (lastMsg ? estimateTokens([lastMsg]) : 0);
+  // Fallback estimate for a cache hit whose token count the caller didn't
+  // supply. Computed ONCE (not per-block): previously this re-estimated the
+  // last message inside the loop, so N read-blocks counted the same message N
+  // times and inflated cacheReadTokens past rawTokens. We attribute the
+  // fallback to at most one read block.
+  const lastMsg = messages.length > 0 ? messages[messages.length - 1] : undefined;
+  const fallbackReadTokens = lastMsg ? estimateTokens([lastMsg]) : 0;
+  let fallbackReadApplied = false;
 
-    if (block.cache_type === "ephemeral" || block.cache_type === "static") {
-      // Treat the block as a write if it has a created_token_count (new cache
-      // entry being created), otherwise treat as a read (cache hit).
-      if (block.created_token_count !== undefined) {
-        cacheWriteTokens += blockTokens;
-      } else {
-        cacheReadTokens += blockTokens;
-      }
+  for (const block of cacheBlocks) {
+    if (block.cache_type !== "ephemeral" && block.cache_type !== "static") {
+      continue;
+    }
+    // A block with an explicit created_token_count is a new cache *write*;
+    // its token count is known exactly and accumulates per block.
+    if (block.created_token_count !== undefined) {
+      cacheWriteTokens += block.created_token_count;
+      continue;
+    }
+    // A block without a count is a cache *hit* (read). We only have a single
+    // rough fallback (the last message), so we attribute it once rather than
+    // re-counting it for every hit block.
+    if (!fallbackReadApplied) {
+      cacheReadTokens += fallbackReadTokens;
+      fallbackReadApplied = true;
     }
   }
 
@@ -741,4 +750,114 @@ export function recordActualTokenUsage(
     actualEffectiveTokens: Math.round(actualEffectiveTokens),
     estimationErrorPct: Math.round(estimationErrorPct * 100) / 100,
   };
+}
+
+// ---------- USD cost oracle ----------
+
+/**
+ * Itemised USD cost breakdown for a single LLM request/response.
+ *
+ * Every field is in **US dollars** (not per-million). The four input classes
+ * are billed at distinct rates per the Anthropic prompt-caching model:
+ *
+ *   inputCost          = uncachedInputTokens   × inputRate × 1.0
+ *   cacheWriteCost     = cacheCreationTokens   × inputRate × 1.25  (CACHE_WRITE_MULTIPLIER)
+ *   cacheReadCost      = cacheReadTokens       × inputRate × 0.1   (CACHE_READ_MULTIPLIER)
+ *   outputCost         = outputTokens          × outputRate
+ *
+ * `totalCost` is the sum of all four. This is the single source of truth that
+ * ties the static `PROVIDER_RATES` table to the cache multipliers — previously
+ * callers had `recordActualTokenUsage` (effective *tokens* only, no output) and
+ * the pricing table, but nothing that produced an actual dollar figure.
+ */
+export interface UsdCostBreakdown {
+  /** USD billed for uncached (1×) input tokens. */
+  inputCost: number;
+  /** USD billed for cache-creation tokens (1.25× input rate). */
+  cacheWriteCost: number;
+  /** USD billed for cache-read tokens (0.1× input rate). */
+  cacheReadCost: number;
+  /** USD billed for output tokens. */
+  outputCost: number;
+  /** Sum of all four cost components. */
+  totalCost: number;
+  /** Resolved provider rate used for the computation. */
+  rate: ProviderRate;
+}
+
+/**
+ * Token-usage shape accepted by {@link costUsdFromUsage}.
+ *
+ * Mirrors the relevant fields of an Anthropic `MessageResponse` but is a plain
+ * structural type so callers can pass usage from any provider/source.
+ */
+export interface TokenUsageInput {
+  /** Uncached input tokens billed at 1× input rate. */
+  inputTokens: number;
+  /** Output tokens billed at the output rate. */
+  outputTokens: number;
+  /** Tokens written to cache this turn (billed at 1.25× input rate). */
+  cacheCreationTokens?: number;
+  /** Tokens read from cache this turn (billed at 0.1× input rate). */
+  cacheReadTokens?: number;
+}
+
+/**
+ * Compute the itemised USD cost of a request from explicit token counts.
+ *
+ * @param usage    Token counts for the four billing classes.
+ * @param provider Provider slug (e.g. `"claude-3-5-sonnet-20241022"`). Resolved
+ *                 via {@link defaultProviderRate} (exact → prefix → default).
+ * @returns        A {@link UsdCostBreakdown} with per-class and total USD.
+ */
+export function costUsdFromUsage(
+  usage: TokenUsageInput,
+  provider: string = "claude-3-5-sonnet",
+): UsdCostBreakdown {
+  const rate = defaultProviderRate(provider);
+  const inputTokens = Math.max(0, usage.inputTokens);
+  const outputTokens = Math.max(0, usage.outputTokens);
+  const cacheCreationTokens = Math.max(0, usage.cacheCreationTokens ?? 0);
+  const cacheReadTokens = Math.max(0, usage.cacheReadTokens ?? 0);
+
+  const inputCost = inputTokens * rate.inputRate;
+  const cacheWriteCost = cacheCreationTokens * rate.inputRate * CACHE_WRITE_MULTIPLIER;
+  const cacheReadCost = cacheReadTokens * rate.inputRate * CACHE_READ_MULTIPLIER;
+  const outputCost = outputTokens * rate.outputRate;
+
+  return {
+    inputCost,
+    cacheWriteCost,
+    cacheReadCost,
+    outputCost,
+    totalCost: inputCost + cacheWriteCost + cacheReadCost + outputCost,
+    rate,
+  };
+}
+
+/**
+ * Compute the itemised USD cost of an Anthropic `MessageResponse`.
+ *
+ * Unlike {@link recordActualTokenUsage} (which yields billing-equivalent
+ * *tokens* and omits output entirely), this produces actual dollars including
+ * the output-token cost — the figure callers need for budgeting, spend caps,
+ * and ROI dashboards.
+ *
+ * @param response The raw Anthropic message response (or compatible shape).
+ * @param provider Provider slug for pricing lookup.
+ * @returns        A {@link UsdCostBreakdown}.
+ */
+export function costUsdFromResponse(
+  response: MessageResponse,
+  provider: string = "claude-3-5-sonnet",
+): UsdCostBreakdown {
+  return costUsdFromUsage(
+    {
+      inputTokens: response.input_tokens ?? 0,
+      outputTokens: response.output_tokens ?? 0,
+      cacheCreationTokens: response.cache_creation_input_tokens ?? 0,
+      cacheReadTokens: response.cache_read_input_tokens ?? 0,
+    },
+    provider,
+  );
 }
