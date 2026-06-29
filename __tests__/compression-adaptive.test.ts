@@ -15,10 +15,12 @@ import { mkdir, rm, writeFile } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
+  calibrateCompressionThresholds,
   compressionHistoryPath,
   learnCompressionThresholds,
   recordCompressionResult,
   selectCompressionTierAdaptive,
+  type CalibrationRecommendation,
   type CompressionFeedback,
   type LearnedThresholds,
 } from "../src/compression/adaptive.ts";
@@ -466,5 +468,254 @@ describe("end-to-end: record → learn → select", () => {
     const learned = await learnCompressionThresholds(tmp);
     expect(learned!.byTier[2].successRate).toBeCloseTo(0.8, 1);
     expect(learned!.byTier[2].sampleCount).toBe(5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// calibrateCompressionThresholds — basic behaviour
+// ---------------------------------------------------------------------------
+
+describe("calibrateCompressionThresholds — basic behaviour", () => {
+  let tmp: string;
+  beforeEach(async () => { tmp = await makeTmpDir(); });
+  afterEach(async () => { await rm(tmp, { recursive: true, force: true }); });
+
+  test("returns no-drift result when no history exists", async () => {
+    const rec = await calibrateCompressionThresholds(tmp);
+    expect(rec.anyDriftDetected).toBe(false);
+    expect(rec.tolerance).toBeCloseTo(0.15);
+    for (const t of [1, 2, 3] as const) {
+      expect(rec.byTier[t].windowSize).toBe(0);
+      expect(rec.byTier[t].driftDetected).toBe(false);
+      expect(rec.byTier[t].weightAdjustment).toBeCloseTo(1.0);
+    }
+  });
+
+  test("respects custom tolerance parameter", async () => {
+    // Seed tier 3 with 30% overshoot — above 0.15 default but below 0.40
+    for (let i = 0; i < 5; i++) {
+      await recordCompressionResult(tmp, 3, 1000, 1300, true);
+    }
+    const rec15 = await calibrateCompressionThresholds(tmp, 0.15);
+    const rec40 = await calibrateCompressionThresholds(tmp, 0.40);
+    expect(rec15.byTier[3].driftDetected).toBe(true);
+    expect(rec40.byTier[3].driftDetected).toBe(false);
+    expect(rec15.tolerance).toBeCloseTo(0.15);
+    expect(rec40.tolerance).toBeCloseTo(0.40);
+  });
+
+  test("calibratedAt is a valid ISO timestamp", async () => {
+    const rec = await calibrateCompressionThresholds(tmp);
+    expect(() => new Date(rec.calibratedAt)).not.toThrow();
+    expect(isNaN(new Date(rec.calibratedAt).getTime())).toBe(false);
+  });
+
+  test("windowSize is capped at 20 even with more records", async () => {
+    // Record 25 entries for tier 3
+    for (let i = 0; i < 25; i++) {
+      await recordCompressionResult(tmp, 3, 1000, 1050, true);
+    }
+    const rec = await calibrateCompressionThresholds(tmp);
+    expect(rec.byTier[3].windowSize).toBe(20);
+  });
+
+  test("weightAdjustment is clamped to [0.5, 3.0]", async () => {
+    // Extreme undercount: actual is 10× estimated → would give 10× weight without clamping
+    for (let i = 0; i < 5; i++) {
+      await recordCompressionResult(tmp, 2, 100, 1000, false);
+    }
+    const rec = await calibrateCompressionThresholds(tmp);
+    expect(rec.byTier[2].weightAdjustment).toBeLessThanOrEqual(3.0);
+    expect(rec.byTier[2].weightAdjustment).toBeGreaterThanOrEqual(0.5);
+  });
+
+  test("computes correct MAPE for a known distribution", async () => {
+    // Each entry has 20% absolute error (actual = 1.2× or 0.8× estimated)
+    await recordCompressionResult(tmp, 3, 1000, 1200, true);  // +20%
+    await recordCompressionResult(tmp, 3, 1000, 800,  true);  // -20%
+    await recordCompressionResult(tmp, 3, 1000, 1200, true);  // +20%
+    await recordCompressionResult(tmp, 3, 1000, 800,  true);  // -20%
+    const rec = await calibrateCompressionThresholds(tmp);
+    // MAPE should be ~20%; signed mean overshoot = 0 → weightAdjustment ≈ 1.0
+    expect(rec.byTier[3].mape).toBeCloseTo(20, 0);
+    expect(rec.byTier[3].weightAdjustment).toBeCloseTo(1.0, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// calibrateCompressionThresholds — drift detection scenarios
+// ---------------------------------------------------------------------------
+
+describe("calibrateCompressionThresholds — drift detection", () => {
+  let tmp: string;
+  beforeEach(async () => { tmp = await makeTmpDir(); });
+  afterEach(async () => { await rm(tmp, { recursive: true, force: true }); });
+
+  test("detects drift after LLM version change (sudden consistent overshoot)", async () => {
+    // Simulate: first 10 records accurate, then 10 records with 30% overshoot
+    // (represents a model upgrade that produces longer token sequences)
+    for (let i = 0; i < 10; i++) {
+      await recordCompressionResult(tmp, 3, 1000, 1010, true);  // ~1% error
+    }
+    for (let i = 0; i < 10; i++) {
+      await recordCompressionResult(tmp, 3, 1000, 1300, true);  // 30% error
+    }
+    // Calibration window = latest 20 records; for tier 3 all 20 fit.
+    // The window is split: 10 accurate + 10 with 30% error → MAPE ≈ 15.5%.
+    // With default tolerance 0.15 this is right at the boundary; use 0.10 to ensure detection.
+    const rec = await calibrateCompressionThresholds(tmp, 0.10);
+    expect(rec.byTier[3].driftDetected).toBe(true);
+    expect(rec.anyDriftDetected).toBe(true);
+    // Weight adjustment should be > 1 (inflate estimates due to positive overshoot)
+    expect(rec.byTier[3].weightAdjustment).toBeGreaterThan(1.0);
+  });
+
+  test("detects drift after cache toggle (estimates suddenly too high)", async () => {
+    // Cache enabled: actual tokens are 25% fewer than estimated (model returns shorter output)
+    for (let i = 0; i < 5; i++) {
+      await recordCompressionResult(tmp, 2, 2000, 1500, true);  // -25% overshoot
+    }
+    const rec = await calibrateCompressionThresholds(tmp, 0.15);
+    expect(rec.byTier[2].driftDetected).toBe(true);
+    // Weight adjustment should be < 1 (deflate estimates since actual < estimated)
+    expect(rec.byTier[2].weightAdjustment).toBeLessThan(1.0);
+    expect(rec.byTier[2].weightAdjustment).toBeGreaterThanOrEqual(0.5);
+  });
+
+  test("no drift detected when estimates are consistently accurate", async () => {
+    // Within ±5% — well below 15% tolerance
+    for (let i = 0; i < 5; i++) {
+      await recordCompressionResult(tmp, 3, 1000, 1040, true);  // +4%
+      await recordCompressionResult(tmp, 3, 1000, 970,  true);  // -3%
+    }
+    const rec = await calibrateCompressionThresholds(tmp, 0.15);
+    expect(rec.byTier[3].driftDetected).toBe(false);
+    expect(rec.anyDriftDetected).toBe(false);
+  });
+
+  test("drift on one tier does not affect unrelated tiers", async () => {
+    // Only tier 1 has drift; tiers 2 and 3 are accurate
+    for (let i = 0; i < 5; i++) {
+      await recordCompressionResult(tmp, 1, 500, 900, false);   // 80% overshoot → drift
+    }
+    for (let i = 0; i < 5; i++) {
+      await recordCompressionResult(tmp, 2, 2000, 2050, true);  // 2.5% — no drift
+      await recordCompressionResult(tmp, 3, 3000, 3030, true);  // 1%   — no drift
+    }
+    const rec = await calibrateCompressionThresholds(tmp, 0.15);
+    expect(rec.byTier[1].driftDetected).toBe(true);
+    expect(rec.byTier[2].driftDetected).toBe(false);
+    expect(rec.byTier[3].driftDetected).toBe(false);
+    expect(rec.anyDriftDetected).toBe(true);
+  });
+
+  test("sliding window: only the latest 20 records affect calibration", async () => {
+    // Write 30 accurate records for tier 3, then 5 with extreme overshoot.
+    // The window (latest 20) contains the 5 bad records + 15 good ones.
+    // An earlier test window of only good records would show no drift.
+    for (let i = 0; i < 30; i++) {
+      await recordCompressionResult(tmp, 3, 1000, 1010, true);
+    }
+    for (let i = 0; i < 5; i++) {
+      await recordCompressionResult(tmp, 3, 1000, 1400, true);  // 40% error
+    }
+    const rec = await calibrateCompressionThresholds(tmp, 0.15);
+    // window = [15 good(~1%) + 5 bad(40%)] → MAPE ≈ (15×1 + 5×40)/20 = 10.75%
+    // Below 15% threshold — confirms window boundary works correctly
+    expect(rec.byTier[3].windowSize).toBe(20);
+    // MAPE should be between 5% and 15% (weighted average of good and bad records)
+    expect(rec.byTier[3].mape).toBeGreaterThan(5);
+    expect(rec.byTier[3].mape).toBeLessThan(15);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// selectCompressionTierAdaptive — calibration integration
+// ---------------------------------------------------------------------------
+
+describe("selectCompressionTierAdaptive — calibration parameter integration", () => {
+  /**
+   * Build a CalibrationRecommendation inline (no file I/O).
+   */
+  function makeCalibration(
+    overrides: Partial<Record<1 | 2 | 3, { driftDetected: boolean; weightAdjustment: number; mape: number }>>,
+  ): CalibrationRecommendation {
+    const defaults = { driftDetected: false, weightAdjustment: 1.0, mape: 2, windowSize: 10 };
+    return {
+      byTier: {
+        1: { tier: 1, ...defaults, ...overrides[1] },
+        2: { tier: 2, ...defaults, ...overrides[2] },
+        3: { tier: 3, ...defaults, ...overrides[3] },
+      },
+      anyDriftDetected: Object.values(overrides).some((v) => v?.driftDetected ?? false),
+      tolerance: 0.15,
+      calibratedAt: new Date().toISOString(),
+    };
+  }
+
+  test("calibration weight overrides history overshoot when drift is detected", () => {
+    // History says tier 3 has 5% overshoot (minor). Calibration says drift detected
+    // with 2.5× weight — this should make tier 3 look much more expensive and cause
+    // escalation when the budget is tight.
+    const msgs = Array.from({ length: 8 }, (_, i) =>
+      textMsg(i % 2 === 0 ? "user" : "assistant", `turn ${i}`),
+    );
+    const history = makeThresholds({
+      3: { successRate: 0.95, avgOvershootPct: 5, sampleCount: 10 },
+      2: { successRate: 0.95, avgOvershootPct: 5, sampleCount: 10 },
+      1: { successRate: 0.99, avgOvershootPct: 0, sampleCount: 10 },
+    });
+    const calibration = makeCalibration({
+      3: { driftDetected: true, weightAdjustment: 2.5, mape: 40 },
+    });
+
+    const { estimateTokensFromMessages: est } = require("../src/tokens/index.ts");
+    const { contextCollapse: cc } = require("../src/compression/context.ts");
+    const t3Tokens = est(cc(msgs));
+    // Budget: fits raw tier-3, but NOT 2.5× calibrated tier-3
+    const tightBudget = Math.round(t3Tokens * 1.8);
+
+    const tierWithCalibration = selectCompressionTierAdaptive(
+      msgs,
+      0,
+      { maxContextTokens: tightBudget + 8192, reserveTokens: 8192 },
+      history,
+      calibration,
+    );
+    // With 2.5× weight on tier 3, it no longer fits → should escalate
+    expect(tierWithCalibration).toBeLessThanOrEqual(2);
+  });
+
+  test("calibration without drift does not change tier selection", () => {
+    const msgs = Array.from({ length: 5 }, (_, i) => textMsg("user", `msg ${i}`));
+    const history = makeThresholds({
+      3: { successRate: 0.95, avgOvershootPct: 5, sampleCount: 10 },
+      2: { successRate: 0.95, avgOvershootPct: 5, sampleCount: 10 },
+      1: { successRate: 0.99, avgOvershootPct: 0, sampleCount: 10 },
+    });
+    // No drift detected anywhere
+    const calibration = makeCalibration({});
+
+    const withoutCalibration = selectCompressionTierAdaptive(
+      msgs, 0, { maxContextTokens: 1_000_000, reserveTokens: 8192 }, history,
+    );
+    const withCalibration = selectCompressionTierAdaptive(
+      msgs, 0, { maxContextTokens: 1_000_000, reserveTokens: 8192 }, history, calibration,
+    );
+    expect(withCalibration).toBe(withoutCalibration);
+  });
+
+  test("null calibration falls back to history-only path", () => {
+    const msgs = Array.from({ length: 5 }, (_, i) => textMsg("user", `msg ${i}`));
+    const history = makeThresholds({
+      3: { successRate: 0.95, avgOvershootPct: 5, sampleCount: 10 },
+    });
+    const withNull = selectCompressionTierAdaptive(
+      msgs, 0, { maxContextTokens: 1_000_000, reserveTokens: 8192 }, history, null,
+    );
+    const withUndefined = selectCompressionTierAdaptive(
+      msgs, 0, { maxContextTokens: 1_000_000, reserveTokens: 8192 }, history,
+    );
+    expect(withNull).toBe(withUndefined);
   });
 });
