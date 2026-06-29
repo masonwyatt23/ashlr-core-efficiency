@@ -19,3 +19,4 @@ export * from "./manifest.ts";
 export * from "./retriever.ts";
 export * from "./scribe.ts";
 export * from "./strategies.ts";
+export * from "./retrieval-adapter.ts";
