@@ -169,13 +169,20 @@ function sectionKey(project: string, section: SectionMeta): string {
 export async function loadDistributedManifest(cwds: string[]): Promise<DistributedManifest | null> {
   if (cwds.length === 0) return null;
 
-  // Load all manifests in parallel
-  const loaded: Array<{ cwd: string; manifest: GenomeManifest }> = [];
-  await Promise.all(
+  // Load all manifests in parallel, but preserve the *supplied* order.
+  // `Promise.all` resolves elements positionally, so indexing back into the
+  // input order keeps the "first root with a valid manifest" semantics and
+  // the documented `_mergedRoots` ordering deterministic regardless of which
+  // filesystem read happens to finish first.
+  const settled = await Promise.all(
     cwds.map(async (cwd) => {
-      const m = await loadManifest(resolve(cwd));
-      if (m) loaded.push({ cwd: resolve(cwd), manifest: m });
+      const r = resolve(cwd);
+      const m = await loadManifest(r);
+      return m ? { cwd: r, manifest: m } : null;
     }),
+  );
+  const loaded: Array<{ cwd: string; manifest: GenomeManifest }> = settled.filter(
+    (x): x is { cwd: string; manifest: GenomeManifest } => x !== null,
   );
 
   if (loaded.length === 0) return null;
