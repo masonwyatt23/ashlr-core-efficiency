@@ -33,6 +33,35 @@ export interface TokenUsage {
   reasoningTokens?: number;
 }
 
+/**
+ * Metadata describing a cache block attached to a prompt.
+ * `cache_type: 'ephemeral'` — cleared at session end (default Anthropic behavior).
+ * `cache_type: 'static'`    — persists across sessions (longer TTL, higher write cost).
+ * `created_token_count`     — token count at cache-write time (optional, from API response).
+ */
+export interface CacheBlockMetadata {
+  cache_type: "ephemeral" | "static";
+  created_token_count?: number;
+}
+
+/**
+ * Subset of the Anthropic `Message` response shape relevant to token accounting.
+ * Mirrors `Anthropic.Message` so callers can pass the raw SDK response without
+ * importing the SDK here.
+ */
+export interface MessageResponse {
+  /** Normal (non-cached) input tokens billed at 1× rate. */
+  input_tokens: number;
+  /** Tokens written into the cache (billed at 1.25× rate). */
+  cache_creation_input_tokens?: number;
+  /** Tokens read from the cache (billed at 0.1× rate). */
+  cache_read_input_tokens?: number;
+  /** Output tokens generated. */
+  output_tokens: number;
+  /** Stop reason from the model. */
+  stop_reason?: string | null;
+}
+
 export interface StreamEvent {
   type:
     | "text_delta"

@@ -12,7 +12,7 @@
  * calls. If load fails, we silently degrade to the heuristic.
  */
 
-import type { ContentBlock, Message } from "../types/index.ts";
+import type { CacheBlockMetadata, ContentBlock, Message, MessageResponse } from "../types/index.ts";
 
 // ---------- heuristic (back-compat, unchanged) ----------
 
@@ -202,4 +202,176 @@ export async function primeTokenizer(
 ): Promise<boolean> {
   const enc = await _loadEncoder(pickEncoding(model));
   return enc !== null;
+}
+
+// ---------- cache-aware token counting ----------
+
+/**
+ * Cost multipliers for Anthropic prompt caching.
+ *
+ * Cache write: tokens are stored and billed at 1.25× the normal input rate.
+ * Cache read:  previously-stored tokens are replayed at 0.1× the normal rate.
+ *
+ * Reference: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+ */
+export const CACHE_WRITE_MULTIPLIER = 1.25;
+export const CACHE_READ_MULTIPLIER = 0.1;
+
+/**
+ * Result of a cache-aware token count.
+ *
+ * - `rawTokens`        — base token estimate for the messages (before any cache adjustment).
+ * - `cacheWriteTokens` — tokens that will be written into the cache this turn.
+ * - `cacheReadTokens`  — tokens that will be read from an existing cache hit.
+ * - `effectiveTokens`  — billing-equivalent token count:
+ *                          rawTokens + cacheWriteTokens×0.25 − cacheReadTokens×0.9
+ *                          (raw already includes those token positions at 1×; we add/subtract
+ *                           the premium/discount on top).
+ */
+export interface CacheAwareTokenCount {
+  rawTokens: number;
+  cacheWriteTokens: number;
+  cacheReadTokens: number;
+  effectiveTokens: number;
+}
+
+/**
+ * Count tokens for a set of messages, accounting for prompt-caching costs.
+ *
+ * @param messages    Provider message array.
+ * @param cacheBlocks Optional array of cache block metadata. Each entry describes
+ *                    one cache checkpoint attached to the prompt.
+ *                    - If `created_token_count` is provided it is used directly.
+ *                    - Otherwise the token count is estimated from the last message.
+ * @param model       Tokenizer model hint (defaults to `"default"`).
+ *
+ * The effective token count adjusts for the 1.25× write premium and 0.1× read discount:
+ *   effectiveTokens = uncachedTokens
+ *                   + cacheWriteTokens × CACHE_WRITE_MULTIPLIER   (1.25×)
+ *                   + cacheReadTokens  × CACHE_READ_MULTIPLIER     (0.1×)
+ *
+ * where uncachedTokens = rawTokens − cacheWriteTokens − cacheReadTokens.
+ */
+export async function countTokensWithCache(
+  messages: Message[],
+  cacheBlocks?: CacheBlockMetadata[],
+  model: TokenizerModel = "default",
+): Promise<CacheAwareTokenCount> {
+  const rawTokens = await countTokensAccurate(messages, model);
+
+  if (!cacheBlocks || cacheBlocks.length === 0) {
+    return {
+      rawTokens,
+      cacheWriteTokens: 0,
+      cacheReadTokens: 0,
+      effectiveTokens: rawTokens,
+    };
+  }
+
+  let cacheWriteTokens = 0;
+  let cacheReadTokens = 0;
+
+  for (const block of cacheBlocks) {
+    // Use the explicit token count when provided; otherwise fall back to
+    // estimating from the last message (conservative approximation).
+    const lastMsg = messages.length > 0 ? messages[messages.length - 1] : undefined;
+    const blockTokens =
+      block.created_token_count ??
+      (lastMsg ? estimateTokens([lastMsg]) : 0);
+
+    if (block.cache_type === "ephemeral" || block.cache_type === "static") {
+      // Treat the block as a write if it has a created_token_count (new cache
+      // entry being created), otherwise treat as a read (cache hit).
+      if (block.created_token_count !== undefined) {
+        cacheWriteTokens += blockTokens;
+      } else {
+        cacheReadTokens += blockTokens;
+      }
+    }
+  }
+
+  // Tokens that are neither written nor read from cache are billed at 1×.
+  const uncachedTokens = Math.max(
+    0,
+    rawTokens - cacheWriteTokens - cacheReadTokens,
+  );
+
+  const effectiveTokens =
+    uncachedTokens +
+    cacheWriteTokens * CACHE_WRITE_MULTIPLIER +
+    cacheReadTokens * CACHE_READ_MULTIPLIER;
+
+  return {
+    rawTokens,
+    cacheWriteTokens,
+    cacheReadTokens,
+    effectiveTokens: Math.round(effectiveTokens),
+  };
+}
+
+// ---------- actual-usage recording (adaptive compression hook) ----------
+
+/**
+ * Result from comparing actual vs estimated token usage.
+ *
+ * This is consumed by the adaptive compression layer to calibrate future
+ * token estimates and tier selection.
+ */
+export interface TokenUsageRecord {
+  /** Tokens estimated before the LLM call. */
+  estimatedTokens: number;
+  /** Actual non-cached input tokens billed at 1× (from response). */
+  actualInputTokens: number;
+  /** Tokens written to cache this turn (billed at 1.25×). */
+  actualCacheCreationTokens: number;
+  /** Tokens read from cache this turn (billed at 0.1×). */
+  actualCacheReadTokens: number;
+  /** Billing-equivalent actual token count. */
+  actualEffectiveTokens: number;
+  /**
+   * Estimation error as a signed percentage:
+   *   ((actualEffective − estimated) / estimated) × 100
+   * Positive → we under-estimated; negative → we over-estimated.
+   */
+  estimationErrorPct: number;
+}
+
+/**
+ * Compute and return a `TokenUsageRecord` from an Anthropic `MessageResponse`.
+ *
+ * Intended as an integration hook called after each LLM response so the
+ * adaptive compression layer can track estimation accuracy and calibrate
+ * future tier selection.
+ *
+ * @param response        The raw Anthropic message response (or a compatible shape).
+ * @param estimatedBefore Token count estimated before the call was made.
+ * @returns               A `TokenUsageRecord` ready to feed into `recordCompressionResult`.
+ */
+export function recordActualTokenUsage(
+  response: MessageResponse,
+  estimatedBefore: number,
+): TokenUsageRecord {
+  const actualInputTokens = response.input_tokens ?? 0;
+  const actualCacheCreationTokens = response.cache_creation_input_tokens ?? 0;
+  const actualCacheReadTokens = response.cache_read_input_tokens ?? 0;
+
+  // Compute billing-equivalent actual token count using the same multipliers.
+  const actualEffectiveTokens =
+    actualInputTokens +
+    actualCacheCreationTokens * CACHE_WRITE_MULTIPLIER +
+    actualCacheReadTokens * CACHE_READ_MULTIPLIER;
+
+  const estimationErrorPct =
+    estimatedBefore > 0
+      ? ((actualEffectiveTokens - estimatedBefore) / estimatedBefore) * 100
+      : 0;
+
+  return {
+    estimatedTokens: estimatedBefore,
+    actualInputTokens,
+    actualCacheCreationTokens,
+    actualCacheReadTokens,
+    actualEffectiveTokens: Math.round(actualEffectiveTokens),
+    estimationErrorPct: Math.round(estimationErrorPct * 100) / 100,
+  };
 }
