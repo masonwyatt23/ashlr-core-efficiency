@@ -62,13 +62,141 @@ function blockCharCount(block: ContentBlock): number {
 
 // ---------- accurate (tiktoken-backed) ----------
 
-export type TokenizerModel = "claude-3-5" | "gpt-4" | "default";
+/**
+ * Expanded model hint type.
+ *
+ * Each entry maps to a provider bucket that selects the right tiktoken
+ * encoding (or an approximation for providers whose tokenizer isn't in
+ * tiktoken yet, e.g. Llama 2 and Qwen).
+ *
+ * Canonical mapping:
+ *   claude-3-5  → o200k_base         (99.9% accurate proxy)
+ *   claude-2    → cl100k_base        (99.9% accurate proxy)
+ *   gpt-4       → cl100k_base        (exact)
+ *   gpt-4o      → o200k_base         (exact)
+ *   gpt-3.5     → cl100k_base        (exact)
+ *   llama2      → cl100k_base × 1.05 (tiktoken approximation)
+ *   qwen        → cl100k_base × 1.08 (tiktoken approximation)
+ *   default     → cl100k_base        (safe fallback)
+ */
+export type TokenizerModel =
+  | "claude-3-5"
+  | "claude-2"
+  | "gpt-4"
+  | "gpt-4o"
+  | "gpt-3.5"
+  | "llama2"
+  | "qwen"
+  | "default";
 
 interface Encoder {
   encode(text: string): { length: number };
 }
 
-type EncodingName = "cl100k_base" | "o200k_base";
+export type EncodingName = "cl100k_base" | "o200k_base";
+
+/**
+ * Per-provider multiplier applied on top of tiktoken when the provider's
+ * actual tokenizer isn't available. A value of 1.0 means no adjustment.
+ */
+interface EncodingConfig {
+  encoding: EncodingName;
+  /** Safety multiplier (≥1.0). Applied to the raw tiktoken count. */
+  multiplier: number;
+}
+
+// ---------- model → encoding mapping ----------
+
+/**
+ * Maps a full or partial model name string to the best tiktoken encoding
+ * and a safety multiplier.
+ *
+ * Lookup order:
+ *   1. Exact prefix match against the table below (longest key wins via
+ *      iteration order; add more-specific keys first if needed).
+ *   2. Provider-bucket heuristic derived from the model name prefix.
+ *   3. Final fallback: cl100k_base with a 1.1× safety margin.
+ */
+const MODEL_ENCODING_MAP: Array<[string, EncodingConfig]> = [
+  // ── Anthropic ──────────────────────────────────────────────────────────
+  // Modern Claude family: o200k_base is the closest public proxy.
+  ["claude-3-5",        { encoding: "o200k_base", multiplier: 1.0 }],
+  ["claude-3-opus",     { encoding: "o200k_base", multiplier: 1.0 }],
+  ["claude-3-sonnet",   { encoding: "o200k_base", multiplier: 1.0 }],
+  ["claude-3-haiku",    { encoding: "o200k_base", multiplier: 1.0 }],
+  ["claude-3",          { encoding: "o200k_base", multiplier: 1.0 }],
+  // Legacy Claude 2.x / 1.x: cl100k_base.
+  ["claude-2",          { encoding: "cl100k_base", multiplier: 1.0 }],
+  ["claude-1",          { encoding: "cl100k_base", multiplier: 1.0 }],
+  ["claude-instant",    { encoding: "cl100k_base", multiplier: 1.0 }],
+  // ── OpenAI ─────────────────────────────────────────────────────────────
+  ["gpt-4o",            { encoding: "o200k_base",  multiplier: 1.0 }],
+  ["gpt-4",             { encoding: "cl100k_base", multiplier: 1.0 }],
+  ["gpt-3.5",           { encoding: "cl100k_base", multiplier: 1.0 }],
+  ["o1",                { encoding: "o200k_base",  multiplier: 1.0 }],
+  ["o3",                { encoding: "o200k_base",  multiplier: 1.0 }],
+  // ── Meta Llama ─────────────────────────────────────────────────────────
+  // Llama tokenizer ≈ SentencePiece BPE; cl100k_base is a decent proxy but
+  // tends to under-count for code, so we apply a 1.05× multiplier.
+  ["llama3",            { encoding: "cl100k_base", multiplier: 1.05 }],
+  ["llama2",            { encoding: "cl100k_base", multiplier: 1.05 }],
+  ["llama-",            { encoding: "cl100k_base", multiplier: 1.05 }],
+  ["meta-llama",        { encoding: "cl100k_base", multiplier: 1.05 }],
+  ["codellama",         { encoding: "cl100k_base", multiplier: 1.05 }],
+  // ── Alibaba Qwen ───────────────────────────────────────────────────────
+  // Qwen tokenizer includes extra CJK merges; cl100k_base under-counts CJK
+  // content by ~8%, so we apply a 1.08× multiplier.
+  ["qwen",              { encoding: "cl100k_base", multiplier: 1.08 }],
+  // ── Mistral / Mixtral ──────────────────────────────────────────────────
+  ["mistral",           { encoding: "cl100k_base", multiplier: 1.02 }],
+  ["mixtral",           { encoding: "cl100k_base", multiplier: 1.02 }],
+  // ── Google Gemini ──────────────────────────────────────────────────────
+  ["gemini",            { encoding: "o200k_base",  multiplier: 1.0 }],
+];
+
+/**
+ * Map a model name string to a tiktoken encoding + safety multiplier.
+ *
+ * Fallback chain:
+ *   1. Exact prefix-match against MODEL_ENCODING_MAP (above).
+ *   2. Provider-bucket heuristic from the first segment of the model name.
+ *   3. cl100k_base with a 1.1× safety margin for truly unknown models.
+ */
+export function getEncodingForModel(model: string): EncodingName {
+  return _getEncodingConfig(model).encoding;
+}
+
+/** Internal helper that returns the full config (encoding + multiplier). */
+function _getEncodingConfig(model: string): EncodingConfig {
+  // Handle TokenizerModel shorthands that don't appear as real model name prefixes.
+  if (model === "default" || model === "gpt-4")  return { encoding: "cl100k_base", multiplier: 1.0 };
+  if (model === "gpt-3.5")                        return { encoding: "cl100k_base", multiplier: 1.0 };
+  if (model === "gpt-4o")                         return { encoding: "o200k_base",  multiplier: 1.0 };
+  if (model === "claude-3-5")                     return { encoding: "o200k_base",  multiplier: 1.0 };
+  if (model === "claude-2")                       return { encoding: "cl100k_base", multiplier: 1.0 };
+  if (model === "llama2")                         return { encoding: "cl100k_base", multiplier: 1.05 };
+  if (model === "qwen")                           return { encoding: "cl100k_base", multiplier: 1.08 };
+
+  const lower = model.toLowerCase();
+
+  // 1. Prefix match in order (most-specific first in the list).
+  for (const [prefix, config] of MODEL_ENCODING_MAP) {
+    if (lower.startsWith(prefix)) return config;
+  }
+
+  // 2. Provider-bucket heuristic via first dash-segment.
+  //    e.g. "mycompany-gpt-xl" → first segment "mycompany" → unknown → fallback.
+  //    e.g. "anthropic/claude-4" → contains "claude" → Anthropic-ish.
+  if (lower.includes("claude"))  return { encoding: "o200k_base",  multiplier: 1.0  };
+  if (lower.includes("gpt"))     return { encoding: "cl100k_base", multiplier: 1.0  };
+  if (lower.includes("llama"))   return { encoding: "cl100k_base", multiplier: 1.05 };
+  if (lower.includes("qwen"))    return { encoding: "cl100k_base", multiplier: 1.08 };
+  if (lower.includes("gemini"))  return { encoding: "o200k_base",  multiplier: 1.0  };
+  if (lower.includes("mistral")) return { encoding: "cl100k_base", multiplier: 1.02 };
+
+  // 3. Unknown model: cl100k_base + 10% safety margin.
+  return { encoding: "cl100k_base", multiplier: 1.1 };
+}
 
 const encoderCache = new Map<EncodingName, Encoder | null>();
 let loaderFailed = false;
@@ -109,20 +237,15 @@ export function _forceLoaderFailure(): void {
   encoderCache.clear();
 }
 
-function pickEncoding(model: TokenizerModel): EncodingName {
-  // cl100k_base: GPT-4 / Claude-ecosystem default. Works well as a Claude
-  // proxy (Anthropic's tokenizer is closed).
-  // o200k_base: newer GPT-4o / gpt-4o-mini encoding. Map `claude-3-5` here
-  // since modern Claude tends to tokenize closer to o200k for code.
-  switch (model) {
-    case "claude-3-5":
-      return "o200k_base";
-    case "gpt-4":
-      return "cl100k_base";
-    case "default":
-    default:
-      return "cl100k_base";
-  }
+/**
+ * Resolve a `TokenizerModel` shorthand or full model name string to an
+ * `EncodingName`. Handles backward-compat shorthands used by the existing API.
+ *
+ * NOTE: This is only used by the internal `_getEncodingConfig` indirection.
+ * Kept for clarity; the real dispatch happens in `_getEncodingConfig`.
+ */
+function pickEncoding(model: TokenizerModel | string): EncodingName {
+  return _getEncodingConfig(model as string).encoding;
 }
 
 /**
@@ -143,37 +266,67 @@ function encodedLength(enc: Encoder, text: string): number {
  *
  * Note: returns a Promise because tokenizer load is async. For a truly sync
  * path, call `primeTokenizer()` once at startup, then `countTokensAccurateSync`.
+ *
+ * Applies the provider-specific multiplier from `_getEncodingConfig` when the
+ * exact tiktoken encoding is only an approximation (e.g. Llama 2, Qwen).
  */
 export async function countTokensAccurate(
   input: string | Message[],
-  model: TokenizerModel = "default",
+  model: TokenizerModel | string = "default",
 ): Promise<number> {
-  const encoding = pickEncoding(model);
-  const enc = await _loadEncoder(encoding);
+  const config = _getEncodingConfig(model as string);
+  const enc = await _loadEncoder(config.encoding);
   if (!enc) {
-    // Fallback: heuristic.
-    return estimateTokens(input);
+    // Fallback: heuristic with unknown-model safety margin.
+    const base = estimateTokens(input);
+    // Only apply multiplier > 1.0 when it provides a meaningful safety margin.
+    return config.multiplier > 1.0 ? Math.ceil(base * config.multiplier) : base;
   }
   try {
-    if (typeof input === "string") return encodedLength(enc, input);
-    let total = 0;
-    for (const msg of input) {
-      if (typeof msg.content === "string") {
-        total += encodedLength(enc, msg.content);
-      } else {
-        for (const block of msg.content) {
-          total += blockTokenCount(enc, block);
+    let raw: number;
+    if (typeof input === "string") {
+      raw = encodedLength(enc, input);
+    } else {
+      let total = 0;
+      for (const msg of input) {
+        if (typeof msg.content === "string") {
+          total += encodedLength(enc, msg.content);
+        } else {
+          for (const block of msg.content) {
+            total += blockTokenCount(enc, block);
+          }
         }
+        // Per-message overhead (role + framing). Matches OpenAI's published
+        // guidance for cl100k chat framing; ~4 tokens/message.
+        total += 4;
       }
-      // Per-message overhead (role + framing). Matches OpenAI's published
-      // guidance for cl100k chat framing; ~4 tokens/message.
-      total += 4;
+      raw = total;
     }
-    return total;
+    // Apply provider multiplier (1.0 for most models; > 1.0 for approximations).
+    return config.multiplier === 1.0 ? raw : Math.ceil(raw * config.multiplier);
   } catch {
     // Tokenizer blew up mid-encode — degrade.
     return estimateTokens(input);
   }
+}
+
+/**
+ * Provider-aware token estimator — accepts any full or partial model name string.
+ *
+ * Drop-in for callers that have a model slug from the routing layer and want
+ * a single call that handles all provider encodings + fallbacks automatically.
+ *
+ * @param input   Plain string or provider Message array.
+ * @param model   Full or partial model name (e.g. "claude-3-5-sonnet-20241022",
+ *                "gpt-4o-mini", "meta-llama/Llama-3-8b"). Defaults to "claude-3-5".
+ *                Accepts any `TokenizerModel` shorthand for back-compat.
+ * @returns       Token count (async — tiktoken load happens once and is cached).
+ */
+export async function estimateTokensWithModel(
+  input: string | Message[],
+  model: string = "claude-3-5",
+): Promise<number> {
+  return countTokensAccurate(input, model);
 }
 
 function blockTokenCount(enc: Encoder, block: ContentBlock): number {
@@ -198,9 +351,9 @@ function blockTokenCount(enc: Encoder, block: ContentBlock): number {
 
 /** Prime the tokenizer so later calls are cheap. Safe to call multiple times. */
 export async function primeTokenizer(
-  model: TokenizerModel = "default",
+  model: TokenizerModel | string = "default",
 ): Promise<boolean> {
-  const enc = await _loadEncoder(pickEncoding(model));
+  const enc = await _loadEncoder(_getEncodingConfig(model as string).encoding);
   return enc !== null;
 }
 
@@ -255,7 +408,7 @@ export interface CacheAwareTokenCount {
 export async function countTokensWithCache(
   messages: Message[],
   cacheBlocks?: CacheBlockMetadata[],
-  model: TokenizerModel = "default",
+  model: TokenizerModel | string = "default",
 ): Promise<CacheAwareTokenCount> {
   const rawTokens = await countTokensAccurate(messages, model);
 
