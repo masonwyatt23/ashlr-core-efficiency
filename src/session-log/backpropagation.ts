@@ -425,7 +425,7 @@ export class BackpropagationEngine {
       const tierStr = parts[parts.length - 2];
       const provider = parts.slice(0, parts.length - 2).join(":");
       const tier = parseInt(tierStr ?? "0", 10) as CompressionTier;
-      if (tier < 1 || tier > 4) continue;
+      if (tier < 1 || tier > 5) continue;
 
       const roi = this.computeROI(tier, provider, bucket);
       if (roi) results.push(roi);
