@@ -27,3 +27,4 @@ export * from "./retrieval-adapter.ts";
 export * from "./graph-traversal.ts";
 export * from "./quantized-ann.ts";
 export * from "./quantization-strategy.ts";
+export * from "./embedding-cache-coherence.ts";
