@@ -13,6 +13,11 @@
  */
 
 import type { CacheBlockMetadata, ContentBlock, Message, MessageResponse } from "../types/index.ts";
+import {
+  appendCalibrationRecord,
+  getActiveCalibratedMultiplier,
+  _resetCalibratedMultipliers,
+} from "./validator.ts";
 
 // ---------- heuristic (back-compat, unchanged) ----------
 
@@ -225,10 +230,14 @@ export async function _loadEncoder(
   }
 }
 
-/** Test hook: reset cached encoders + failure flag. */
+/** Test hook: reset cached encoders + failure flag + calibrated multipliers. */
 export function _resetTokenizerCache(): void {
   encoderCache.clear();
   loaderFailed = false;
+  // Also clear any live-calibrated multipliers so tests that call
+  // _resetTokenizerCache() get a clean slate and calibration state from one
+  // test file cannot bleed into another.
+  _resetCalibratedMultipliers();
 }
 
 /** Test hook: force the loader to fail on next call (simulate missing dep). */
@@ -277,9 +286,12 @@ export async function countTokensAccurate(
   const config = _getEncodingConfig(model as string);
   const enc = await _loadEncoder(config.encoding);
   if (!enc) {
-    // Fallback: heuristic with unknown-model safety margin.
+    // Fallback: heuristic with the static table multiplier only.
+    // We deliberately do NOT apply the calibrated multiplier here because the
+    // chars/4 heuristic is already very rough — blending a live-calibrated
+    // correction on top would produce unpredictable results and break
+    // back-compat guarantees for callers that rely on the heuristic path.
     const base = estimateTokens(input);
-    // Only apply multiplier > 1.0 when it provides a meaningful safety margin.
     return config.multiplier > 1.0 ? Math.ceil(base * config.multiplier) : base;
   }
   try {
@@ -302,8 +314,13 @@ export async function countTokensAccurate(
       }
       raw = total;
     }
-    // Apply provider multiplier (1.0 for most models; > 1.0 for approximations).
-    return config.multiplier === 1.0 ? raw : Math.ceil(raw * config.multiplier);
+    // When tiktoken is available, apply the live calibrated multiplier when one
+    // exists; otherwise use the static table value.
+    // getActiveCalibratedMultiplier returns null until the first
+    // validateAndRecalibrate() call for this model.
+    const activeMultiplier =
+      getActiveCalibratedMultiplier(model as string) ?? config.multiplier;
+    return activeMultiplier === 1.0 ? raw : Math.ceil(raw * activeMultiplier);
   } catch {
     // Tokenizer blew up mid-encode — degrade.
     return estimateTokens(input);
@@ -588,6 +605,7 @@ export interface TokenUsageRecord {
 export function recordActualTokenUsage(
   response: MessageResponse,
   estimatedBefore: number,
+  model: string = "default",
 ): TokenUsageRecord {
   const actualInputTokens = response.input_tokens ?? 0;
   const actualCacheCreationTokens = response.cache_creation_input_tokens ?? 0;
@@ -603,6 +621,19 @@ export function recordActualTokenUsage(
     estimatedBefore > 0
       ? ((actualEffectiveTokens - estimatedBefore) / estimatedBefore) * 100
       : 0;
+
+  // Fire-and-forget: persist the (estimated, actual) pair so the calibration
+  // validator can compute drift and recalibrate multipliers over time.
+  if (estimatedBefore > 0 && Math.round(actualEffectiveTokens) > 0) {
+    appendCalibrationRecord({
+      timestamp: new Date().toISOString(),
+      model,
+      estimated: estimatedBefore,
+      actual: Math.round(actualEffectiveTokens),
+    }).catch(() => {
+      // Non-fatal — calibration is best-effort.
+    });
+  }
 
   return {
     estimatedTokens: estimatedBefore,
