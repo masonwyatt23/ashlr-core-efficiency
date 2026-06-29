@@ -18,6 +18,19 @@ import {
   getActiveCalibratedMultiplier,
   _resetCalibratedMultipliers,
 } from "./validator.ts";
+import { CodecRegistry } from "./provider-codec.ts";
+import { RecalibrationEngine } from "./recalibration-engine.ts";
+
+// Re-export codec registry and recalibration engine for consumers.
+export { CodecRegistry } from "./provider-codec.ts";
+export type { ProviderTokenCodec, MessageBin } from "./provider-codec.ts";
+export { classifyMessage } from "./provider-codec.ts";
+export { RecalibrationEngine } from "./recalibration-engine.ts";
+export type {
+  RecalibrationRecord,
+  BinStats,
+  ProviderCalibrationState,
+} from "./recalibration-engine.ts";
 
 // ---------- heuristic (back-compat, unchanged) ----------
 
@@ -372,6 +385,54 @@ export async function primeTokenizer(
 ): Promise<boolean> {
   const enc = await _loadEncoder(_getEncodingConfig(model as string).encoding);
   return enc !== null;
+}
+
+// ---------- calibratedEstimate — adaptive per-request accuracy ----------
+
+/**
+ * Adaptive, per-request token estimator that combines tiktoken accuracy,
+ * per-provider codec selection, and live recalibration from the
+ * RecalibrationEngine.
+ *
+ * Estimation pipeline:
+ *   1. Use `countTokensAccurate` (tiktoken if available, else chars/4) for the
+ *      base estimate — identical to the existing accurate path.
+ *   2. Look up the per-provider × per-bin correction factor from the
+ *      RecalibrationEngine (if enough samples have been recorded).
+ *   3. Multiply and return.
+ *
+ * On the very first call for a provider (zero history), the correction factor
+ * is 1.0, so the result is identical to `countTokensAccurate` — perfect
+ * backward compatibility.
+ *
+ * @param messages   Provider Message array.
+ * @param provider   Full or partial model slug (e.g. "claude-3-5-sonnet-20241022").
+ *                   Defaults to "claude-3-5".
+ * @param history    Optional: pass the RecalibrationEngine to use a non-singleton
+ *                   instance (e.g. in tests).
+ * @returns          Token count (async — tiktoken load is cached after first call).
+ *
+ * @example
+ *   const n = await calibratedEstimate(messages, "claude-3-5-sonnet-20241022");
+ */
+export async function calibratedEstimate(
+  messages: Message[],
+  provider: string = "claude-3-5",
+  history?: RecalibrationEngine,
+): Promise<number> {
+  // Step 1: get the tiktoken-accurate base estimate (or heuristic fallback).
+  const base = await countTokensAccurate(messages, provider);
+
+  // Step 2: determine the bin for the last message.
+  const { classifyMessage } = await import("./provider-codec.ts");
+  const lastMsg = messages.length > 0 ? messages[messages.length - 1] : undefined;
+  const bin = lastMsg ? classifyMessage(lastMsg) : "text";
+
+  // Step 3: apply the per-provider × per-bin correction factor.
+  const engine = history ?? RecalibrationEngine.instance;
+  const factor = engine.correctionFactor(provider, bin);
+
+  return factor === 1.0 ? base : Math.ceil(base * factor);
 }
 
 // ---------- cache-aware token counting ----------
