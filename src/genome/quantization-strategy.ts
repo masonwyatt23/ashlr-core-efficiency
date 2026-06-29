@@ -22,6 +22,12 @@ import { appendJsonl, readJsonl } from "./jsonl.ts";
 import { genomeDir, type GenomeManifest, type SectionMeta } from "./manifest.ts";
 import { join } from "path";
 import { homedir } from "os";
+import {
+  globalCodecAffinityStore,
+  classifySectionType,
+  type SectionTypeBucket,
+  type CodecAffinityRecord,
+} from "./embedding-codec.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -2331,3 +2337,589 @@ export class QuantizationAdvisor {
     return parts.join(" ");
   }
 }
+
+// ---------------------------------------------------------------------------
+// QuantizationNegotiator
+// ---------------------------------------------------------------------------
+
+/**
+ * The four codec tiers available for per-retrieval negotiation.
+ *
+ * Priority order (highest quality → lowest): bfloat16 → int8 → int4 → float32
+ *
+ * Note: bfloat16 is preferred over int8 for most smooth embedding distributions
+ * because it has ~20× lower MAE while providing the same 2× storage reduction.
+ * float32 is the unconditional fallback for safety.
+ */
+export type NegotiatorCodecTier = "bfloat16" | "int8" | "int4" | "float32";
+
+/**
+ * The priority-ranked codec chain used by QuantizationNegotiator.
+ * Index 0 = most preferred (best quality/storage trade-off).
+ * Index 3 = unconditional fallback (lossless, always safe).
+ */
+export const NEGOTIATOR_CODEC_CHAIN: readonly NegotiatorCodecTier[] = [
+  "bfloat16",
+  "int8",
+  "int4",
+  "float32",
+] as const;
+
+/**
+ * Context observed at the time of a retrieval request, used by
+ * QuantizationNegotiator to select the best codec.
+ */
+export interface NegotiatorContext {
+  /**
+   * Number of dimensions in the embedding vectors being retrieved.
+   * Used to estimate memory footprint for each codec tier.
+   */
+  embeddingDims: number;
+
+  /**
+   * Available heap memory in bytes at the time of the request.
+   * Obtain via `process.memoryUsage().heapTotal - process.memoryUsage().heapUsed`.
+   * Set to Infinity to disable memory-based codec downgrade.
+   */
+  availableHeapBytes: number;
+
+  /**
+   * Remaining latency budget for this retrieval in ms.
+   * Codec tiers with high reconstruction cost are avoided when budget is tight.
+   * Set to Infinity to disable latency-based codec downgrade.
+   */
+  latencyBudgetMs: number;
+
+  /**
+   * Section type bucket for the section(s) being retrieved.
+   * Used to query per-section codec affinity learned from past retrievals.
+   * Set to "unknown" when the section type is not known.
+   */
+  sectionType: SectionTypeBucket;
+
+  /**
+   * Number of candidates being scored in this retrieval pass.
+   * Affects total memory and latency cost of reconstruction.
+   */
+  candidateCount: number;
+}
+
+/**
+ * Result of a codec negotiation.
+ */
+export interface NegotiatorResult {
+  /** The selected codec format name (matches EmbeddingCodec.format). */
+  codecFormat: string;
+  /** Index in NEGOTIATOR_CODEC_CHAIN (0 = preferred, 3 = fallback). */
+  tierIndex: number;
+  /** Whether the preferred codec (index 0) was selected. */
+  isPreferred: boolean;
+  /** Whether the unconditional fallback (float32) was selected. */
+  isFallback: boolean;
+  /**
+   * Short explanation of why this codec was selected.
+   * Includes which constraints triggered a downgrade, if any.
+   */
+  rationale: string;
+  /**
+   * Estimated memory footprint in bytes for reconstructing all candidates
+   * at the selected codec tier.
+   */
+  estimatedMemoryBytes: number;
+}
+
+/**
+ * A/B quality observation recorded after a retrieval completes.
+ * Pass this to `recordCodecQuality()` to train the MLP-based predictor.
+ */
+export interface CodecQualityObservation {
+  /** The codec that was used. */
+  codecFormat: string;
+  /** Section type bucket of the retrieved section(s). */
+  sectionType: SectionTypeBucket;
+  /** Mean absolute error of reconstruction vs float32 for this batch. */
+  reconstructionMae: number;
+  /**
+   * NDCG@5 for this retrieval vs a float32 reference ranking.
+   * Null when the float32 baseline was not available for comparison.
+   */
+  ndcgAt5: number | null;
+  /** Actual retrieval latency in ms. */
+  latencyMs: number;
+}
+
+/**
+ * Lightweight two-layer MLP codec predictor.
+ *
+ * Architecture: 5 inputs → 8 hidden (ReLU) → 4 outputs (softmax over codec tiers).
+ *
+ * Input features:
+ *   [0] normalizedDims          — embeddingDims / 1536
+ *   [1] normalizedHeap          — min(availableHeapBytes / 1e9, 1)
+ *   [2] normalizedBudget        — min(latencyBudgetMs / 1000, 1)
+ *   [3] normalizedCandidates    — min(candidateCount / 500, 1)
+ *   [4] affinityTierIndex       — best known affinity tier index / 3 (0 when unknown)
+ *
+ * Output: index in NEGOTIATOR_CODEC_CHAIN (0=bfloat16, 1=int8, 2=int4, 3=float32).
+ *
+ * Weights are updated via a single online gradient step after each observation
+ * (stochastic gradient descent, lr=0.01, cross-entropy loss).
+ */
+export class CodecPredictor {
+  // Layer 1 weights: [hiddenSize × inputSize]
+  private _w1: number[][];
+  // Layer 1 biases: [hiddenSize]
+  private _b1: number[];
+  // Layer 2 weights: [outputSize × hiddenSize]
+  private _w2: number[][];
+  // Layer 2 biases: [outputSize]
+  private _b2: number[];
+
+  private readonly _inputSize = 5;
+  private readonly _hiddenSize = 8;
+  private readonly _outputSize = 4; // one per NEGOTIATOR_CODEC_CHAIN entry
+  private readonly _lr: number;
+
+  constructor(learningRate = 0.01) {
+    this._lr = learningRate;
+    // Xavier initialization: scale = sqrt(2 / (fan_in + fan_out))
+    this._w1 = this._initWeights(this._hiddenSize, this._inputSize, this._inputSize + this._hiddenSize);
+    this._b1 = new Array(this._hiddenSize).fill(0);
+    this._w2 = this._initWeights(this._outputSize, this._hiddenSize, this._hiddenSize + this._outputSize);
+    this._b2 = new Array(this._outputSize).fill(0);
+  }
+
+  /**
+   * Forward pass: return softmax probabilities over the four codec tiers.
+   * @param features  Input feature vector (length 5).
+   */
+  forward(features: number[]): number[] {
+    // Hidden layer
+    const h = this._relu(this._linear(features, this._w1, this._b1));
+    // Output layer
+    const logits = this._linear(h, this._w2, this._b2);
+    return this._softmax(logits);
+  }
+
+  /**
+   * Predict the best codec tier index for the given features.
+   * Returns the index in NEGOTIATOR_CODEC_CHAIN with the highest probability.
+   */
+  predict(features: number[]): number {
+    const probs = this.forward(features);
+    let best = 0;
+    for (let i = 1; i < probs.length; i++) {
+      if (probs[i]! > probs[best]!) best = i;
+    }
+    return best;
+  }
+
+  /**
+   * Online SGD update step using cross-entropy loss.
+   * @param features  Input features for this observation.
+   * @param label     True codec tier index (0–3).
+   */
+  update(features: number[], label: number): void {
+    // Forward pass (keep activations for backprop)
+    const h = this._relu(this._linear(features, this._w1, this._b1));
+    const logits = this._linear(h, this._w2, this._b2);
+    const probs = this._softmax(logits);
+
+    // Output gradient: dL/dlogits = probs - one_hot(label)
+    const dLogits = probs.map((p, i) => p - (i === label ? 1 : 0));
+
+    // Gradient for W2 and b2
+    for (let i = 0; i < this._outputSize; i++) {
+      for (let j = 0; j < this._hiddenSize; j++) {
+        this._w2[i]![j]! -= this._lr * dLogits[i]! * h[j]!;
+      }
+      this._b2[i]! -= this._lr * dLogits[i]!;
+    }
+
+    // Backprop through hidden layer (ReLU gradient)
+    const dH: number[] = new Array(this._hiddenSize).fill(0);
+    for (let j = 0; j < this._hiddenSize; j++) {
+      for (let i = 0; i < this._outputSize; i++) {
+        dH[j]! += this._w2[i]![j]! * dLogits[i]!;
+      }
+      dH[j]! *= h[j]! > 0 ? 1 : 0; // ReLU derivative
+    }
+
+    // Gradient for W1 and b1
+    for (let j = 0; j < this._hiddenSize; j++) {
+      for (let k = 0; k < this._inputSize; k++) {
+        this._w1[j]![k]! -= this._lr * dH[j]! * features[k]!;
+      }
+      this._b1[j]! -= this._lr * dH[j]!;
+    }
+  }
+
+  // ── Private helpers ──────────────────────────────────────────────────────
+
+  private _initWeights(rows: number, cols: number, fanTotal: number): number[][] {
+    const scale = Math.sqrt(2 / fanTotal);
+    // Deterministic LCG-based initialization (no external PRNG dependency)
+    let seed = 42;
+    const rand = (): number => {
+      seed = (seed * 1664525 + 1013904223) & 0xffffffff;
+      return ((seed >>> 16) / 32768 - 1) * scale;
+    };
+    return Array.from({ length: rows }, () => Array.from({ length: cols }, rand));
+  }
+
+  private _linear(x: number[], w: number[][], b: number[]): number[] {
+    return w.map((row, i) => row.reduce((s, wij, j) => s + wij * (x[j] ?? 0), b[i] ?? 0));
+  }
+
+  private _relu(x: number[]): number[] {
+    return x.map((v) => Math.max(0, v));
+  }
+
+  private _softmax(x: number[]): number[] {
+    const max = Math.max(...x);
+    const exps = x.map((v) => Math.exp(v - max));
+    const sum = exps.reduce((s, v) => s + v, 0);
+    return exps.map((v) => (sum > 0 ? v / sum : 1 / x.length));
+  }
+}
+
+/**
+ * Options for `QuantizationNegotiator`.
+ */
+export interface QuantizationNegotiatorOptions {
+  /**
+   * Memory safety margin fraction. When available heap is below
+   * `safetyMargin * estimatedPeakUsageBytes`, the negotiator downgrades
+   * to a cheaper codec. Default: 0.2 (20% headroom).
+   */
+  memorySafetyMargin?: number;
+
+  /**
+   * Latency budget fraction below which a codec tier is considered "tight".
+   * When `latencyBudgetMs` is less than this fraction of the codec's
+   * expected reconstruction time, the negotiator skips that tier.
+   * Default: 1.5 (the budget must be ≥ 1.5× the expected cost).
+   */
+  latencySlackFactor?: number;
+
+  /**
+   * Per-tier expected reconstruction cost in ms per 1000 dimensions per candidate.
+   * Used to estimate whether the latency budget accommodates a tier.
+   * Defaults:
+   *   bfloat16: 0.004 ms / (1000 dims × candidate)
+   *   int8:     0.006 ms / (1000 dims × candidate)
+   *   int4:     0.010 ms / (1000 dims × candidate)
+   *   float32:  0.002 ms / (1000 dims × candidate)
+   */
+  tierCostMs?: Partial<Record<NegotiatorCodecTier, number>>;
+
+  /**
+   * Minimum A/B observations required before the MLP predictor's output is
+   * trusted over the heuristic chain walk. Default: 20.
+   */
+  mlpMinObservations?: number;
+
+  /**
+   * Learning rate for the MLP codec predictor. Default: 0.01.
+   */
+  mlpLearningRate?: number;
+
+  /**
+   * Affinity store to use. Defaults to `globalCodecAffinityStore`.
+   * Override in tests to keep state isolated.
+   */
+  affinityStore?: typeof globalCodecAffinityStore;
+}
+
+/**
+ * QuantizationNegotiator: per-retrieval codec selection via constraint-aware
+ * heuristics + an online MLP predictor.
+ *
+ * Responsibilities:
+ *  1. Walk the `NEGOTIATOR_CODEC_CHAIN` (bfloat16 → int8 → int4 → float32),
+ *     skipping tiers that violate the heap memory or latency SLA constraints.
+ *  2. Consult per-section-type codec affinity (learned from past observations)
+ *     to bias the chain walk toward the historically best codec for this section type.
+ *  3. Once `mlpMinObservations` A/B records have been collected, delegate the
+ *     initial tier selection to the trained `CodecPredictor` MLP, using the
+ *     heuristic chain only as a safety net.
+ *  4. After each retrieval, accept a `CodecQualityObservation` to update both
+ *     the affinity store and the MLP weights.
+ *
+ * The negotiator is stateful (accumulates observations across calls) and is
+ * intended to be used as a long-lived object per retrieval session.
+ */
+export class QuantizationNegotiator {
+  private readonly _memorySafetyMargin: number;
+  private readonly _latencySlackFactor: number;
+  private readonly _tierCostMs: Record<NegotiatorCodecTier, number>;
+  private readonly _mlpMinObservations: number;
+  private readonly _predictor: CodecPredictor;
+  private readonly _affinityStore: typeof globalCodecAffinityStore;
+
+  private _observationCount = 0;
+
+  constructor(options: QuantizationNegotiatorOptions = {}) {
+    this._memorySafetyMargin = options.memorySafetyMargin ?? 0.2;
+    this._latencySlackFactor = options.latencySlackFactor ?? 1.5;
+    this._tierCostMs = {
+      bfloat16: options.tierCostMs?.bfloat16 ?? 0.004,
+      int8:     options.tierCostMs?.int8     ?? 0.006,
+      int4:     options.tierCostMs?.int4     ?? 0.010,
+      float32:  options.tierCostMs?.float32  ?? 0.002,
+    };
+    this._mlpMinObservations = options.mlpMinObservations ?? 20;
+    this._predictor = new CodecPredictor(options.mlpLearningRate ?? 0.01);
+    this._affinityStore = options.affinityStore ?? globalCodecAffinityStore;
+  }
+
+  /**
+   * Select the best codec for a retrieval given the current runtime context.
+   *
+   * Algorithm:
+   *  1. Extract features from the context for the MLP.
+   *  2. If `_observationCount >= mlpMinObservations`, use MLP prediction as the
+   *     preferred starting tier. Otherwise start from tier index 0 (bfloat16).
+   *  3. Walk the chain from the starting tier, skipping any tier that:
+   *     a. Exceeds available heap (with safety margin), or
+   *     b. Has an expected reconstruction cost > latencyBudgetMs / latencySlackFactor.
+   *  4. Return the first tier that passes all constraints (float32 always passes).
+   */
+  selectCodec(ctx: NegotiatorContext): NegotiatorResult {
+    const features = this._extractFeatures(ctx);
+
+    // Determine starting tier: MLP suggestion (if trained) or 0 (bfloat16)
+    let startIndex = 0;
+    let mlpUsed = false;
+    if (this._observationCount >= this._mlpMinObservations) {
+      startIndex = this._predictor.predict(features);
+      mlpUsed = true;
+    } else {
+      // Check affinity store for a known-good codec for this section type
+      const affinityBest = this._affinityStore.getBestCodec(ctx.sectionType);
+      if (affinityBest !== null) {
+        const idx = NEGOTIATOR_CODEC_CHAIN.indexOf(affinityBest as NegotiatorCodecTier);
+        if (idx >= 0) startIndex = idx;
+      }
+    }
+
+    // Walk chain from startIndex, fall back to float32 if all fail
+    for (let i = startIndex; i < NEGOTIATOR_CODEC_CHAIN.length; i++) {
+      const tier = NEGOTIATOR_CODEC_CHAIN[i]!;
+      const check = this._checkConstraints(tier, ctx);
+      if (check.passes) {
+        const memBytes = this._estimateMemory(tier, ctx);
+        return {
+          codecFormat: tier,
+          tierIndex: i,
+          isPreferred: i === 0,
+          isFallback: tier === "float32",
+          rationale: this._buildRationale(tier, i, startIndex, mlpUsed, check.reason),
+          estimatedMemoryBytes: memBytes,
+        };
+      }
+    }
+
+    // Should never reach here (float32 always passes), but guard defensively
+    const fallbackMemBytes = this._estimateMemory("float32", ctx);
+    return {
+      codecFormat: "float32",
+      tierIndex: NEGOTIATOR_CODEC_CHAIN.length - 1,
+      isPreferred: false,
+      isFallback: true,
+      rationale: "All tiers failed constraints; using float32 as unconditional fallback.",
+      estimatedMemoryBytes: fallbackMemBytes,
+    };
+  }
+
+  /**
+   * Record a codec quality observation after a retrieval completes.
+   * Updates both the affinity store and the MLP predictor weights.
+   *
+   * @param obs      Quality metrics for the completed retrieval.
+   * @param context  The same NegotiatorContext passed to `selectCodec`.
+   */
+  recordObservation(obs: CodecQualityObservation, context: NegotiatorContext): void {
+    // Update affinity store
+    const affinityRec: Omit<CodecAffinityRecord, "observedAt"> = {
+      sectionType: obs.sectionType,
+      codecFormat: obs.codecFormat,
+      reconstructionMae: obs.reconstructionMae,
+      ndcgAt5: obs.ndcgAt5,
+      latencyMs: obs.latencyMs,
+    };
+    this._affinityStore.record(affinityRec);
+
+    // Determine the "true" best tier label for the MLP update.
+    // Label = tier index of the codec used, biased toward better tiers when
+    // quality was high (ndcg >= 0.95) and toward worse tiers when quality was low.
+    const tierIdx = NEGOTIATOR_CODEC_CHAIN.indexOf(obs.codecFormat as NegotiatorCodecTier);
+    if (tierIdx >= 0) {
+      const features = this._extractFeatures(context);
+      let label = tierIdx;
+      // If quality was excellent, push toward cheaper (higher index) tiers
+      if (obs.ndcgAt5 !== null && obs.ndcgAt5 >= 0.95 && obs.reconstructionMae < 0.01) {
+        label = Math.min(tierIdx + 1, NEGOTIATOR_CODEC_CHAIN.length - 1);
+      }
+      // If quality was poor, push toward more precise (lower index) tiers
+      if (obs.ndcgAt5 !== null && obs.ndcgAt5 < 0.80) {
+        label = Math.max(tierIdx - 1, 0);
+      }
+      this._predictor.update(features, label);
+      this._observationCount++;
+    }
+  }
+
+  /** Number of quality observations collected so far. */
+  get observationCount(): number {
+    return this._observationCount;
+  }
+
+  /** Whether the MLP predictor is active (enough observations collected). */
+  get mlpActive(): boolean {
+    return this._observationCount >= this._mlpMinObservations;
+  }
+
+  // ── Private helpers ──────────────────────────────────────────────────────
+
+  private _extractFeatures(ctx: NegotiatorContext): number[] {
+    // Get best affinity tier index (normalized)
+    const bestAffinity = this._affinityStore.getBestCodec(ctx.sectionType);
+    const affinityIdx = bestAffinity !== null
+      ? Math.max(0, NEGOTIATOR_CODEC_CHAIN.indexOf(bestAffinity as NegotiatorCodecTier))
+      : 0;
+
+    return [
+      Math.min(ctx.embeddingDims / 1536, 1),
+      Math.min(ctx.availableHeapBytes / 1e9, 1),
+      Math.min(ctx.latencyBudgetMs / 1000, 1),
+      Math.min(ctx.candidateCount / 500, 1),
+      affinityIdx / 3,
+    ];
+  }
+
+  private _estimateMemory(tier: NegotiatorCodecTier, ctx: NegotiatorContext): number {
+    const bytesPerDim: Record<NegotiatorCodecTier, number> = {
+      bfloat16: 2,
+      int8:     1,
+      int4:     0.5,
+      float32:  4,
+    };
+    return Math.ceil(ctx.embeddingDims * bytesPerDim[tier] * ctx.candidateCount);
+  }
+
+  private _checkConstraints(
+    tier: NegotiatorCodecTier,
+    ctx: NegotiatorContext,
+  ): { passes: boolean; reason: string } {
+    const memBytes = this._estimateMemory(tier, ctx);
+    const safeHeap = ctx.availableHeapBytes * (1 - this._memorySafetyMargin);
+    if (memBytes > safeHeap) {
+      return {
+        passes: false,
+        reason: `memory: need ${memBytes}B > safe heap ${safeHeap.toFixed(0)}B`,
+      };
+    }
+
+    // Estimate reconstruction cost: tierCostMs per 1000 dims per candidate
+    const expectedCostMs =
+      this._tierCostMs[tier] * (ctx.embeddingDims / 1000) * ctx.candidateCount;
+    const allowedCost = ctx.latencyBudgetMs / this._latencySlackFactor;
+    if (expectedCostMs > allowedCost) {
+      return {
+        passes: false,
+        reason: `latency: expected ${expectedCostMs.toFixed(2)}ms > budget/${this._latencySlackFactor} = ${allowedCost.toFixed(2)}ms`,
+      };
+    }
+
+    return { passes: true, reason: "ok" };
+  }
+
+  private _buildRationale(
+    tier: NegotiatorCodecTier,
+    tierIndex: number,
+    startIndex: number,
+    mlpUsed: boolean,
+    constraintReason: string,
+  ): string {
+    const parts: string[] = [];
+    if (mlpUsed) {
+      parts.push(`MLP predicted tier ${startIndex} (${NEGOTIATOR_CODEC_CHAIN[startIndex]})`);
+    } else if (startIndex > 0) {
+      parts.push(`affinity-biased start at tier ${startIndex} (${NEGOTIATOR_CODEC_CHAIN[startIndex]})`);
+    }
+    if (tierIndex !== startIndex) {
+      parts.push(`degraded to tier ${tierIndex} (${tier}) after ${tierIndex - startIndex} skips`);
+    } else {
+      parts.push(`selected tier ${tierIndex} (${tier})`);
+    }
+    if (constraintReason !== "ok") {
+      parts.push(`constraint: ${constraintReason}`);
+    }
+    return parts.join("; ");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Module-level convenience functions (exported API)
+// ---------------------------------------------------------------------------
+
+/** Module-level singleton negotiator (lazy-initialized). */
+let _defaultNegotiator: QuantizationNegotiator | null = null;
+
+function _getDefaultNegotiator(): QuantizationNegotiator {
+  if (!_defaultNegotiator) _defaultNegotiator = new QuantizationNegotiator();
+  return _defaultNegotiator;
+}
+
+/**
+ * Select the best codec for a retrieval request.
+ *
+ * Uses the module-level `QuantizationNegotiator` singleton. For production
+ * usage where you need isolated state (e.g. per-session), create a dedicated
+ * `QuantizationNegotiator` instance instead.
+ *
+ * @param ctx  Runtime context for the retrieval (dims, heap, latency budget, etc.)
+ * @returns    NegotiatorResult with selected codec and rationale.
+ */
+export function selectCodecForRetrieval(ctx: NegotiatorContext): NegotiatorResult {
+  return _getDefaultNegotiator().selectCodec(ctx);
+}
+
+/**
+ * Record codec quality metrics after a retrieval completes.
+ *
+ * Updates the affinity store and MLP predictor weights in the module-level
+ * negotiator singleton. For isolated sessions, call
+ * `QuantizationNegotiator.recordObservation()` directly.
+ *
+ * @param obs      Reconstruction error + NDCG@5 for the completed retrieval.
+ * @param context  The NegotiatorContext that was used to select the codec.
+ */
+export function recordCodecQuality(
+  obs: CodecQualityObservation,
+  context: NegotiatorContext,
+): void {
+  _getDefaultNegotiator().recordObservation(obs, context);
+}
+
+/**
+ * Return per-section-type codec affinity summaries from the module-level
+ * affinity store.
+ *
+ * @param sectionType  If provided, return summaries only for this bucket.
+ *                     If omitted, return all known section types.
+ */
+export function getCodecAffinity(
+  sectionType?: SectionTypeBucket,
+): Map<SectionTypeBucket, import("./embedding-codec.ts").CodecAffinitySummary[]> {
+  const store = globalCodecAffinityStore;
+  if (sectionType !== undefined) {
+    const summaries = store.getAffinityMap().get(sectionType) ?? [];
+    return new Map([[sectionType, summaries]]);
+  }
+  return store.getAffinityMap();
+}
+
+// Re-export for consumers
+export type { SectionTypeBucket } from "./embedding-codec.ts";

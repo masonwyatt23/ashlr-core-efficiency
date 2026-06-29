@@ -479,3 +479,310 @@ export function getCodecForEmbedding(
   if (cache.quantization_level === 16) return registry.get("int16");
   return registry.get("float32");
 }
+
+// ---------------------------------------------------------------------------
+// Codec Metadata Versioning
+// ---------------------------------------------------------------------------
+
+/**
+ * Current codec schema version. Bump this when the binary layout of any
+ * built-in codec changes in a breaking way so that EmbeddingCache readers
+ * can detect mixed-version entries and trigger re-encoding.
+ *
+ * Version history:
+ *   1 — original float32/int16/int8/int4 codecs (initial release)
+ *   2 — header extended with codec_schema_version field (this release)
+ */
+export const CODEC_SCHEMA_VERSION = 2 as const;
+
+/**
+ * Versioned metadata stored alongside every cache entry.
+ * Extends EmbeddingCodecMeta with a schema version number so that a reader
+ * running a newer codebase can detect entries written by an older codec.
+ */
+export interface VersionedEmbeddingCodecMeta extends EmbeddingCodecMeta {
+  /**
+   * Schema version of the codec that wrote this entry.
+   * Missing on v1 entries (written before this field existed).
+   */
+  codec_schema_version?: number;
+  /**
+   * ISO timestamp when the entry was encoded, for age-based staleness checks.
+   */
+  encoded_at?: string;
+}
+
+/**
+ * Serialize an embedding with full versioned metadata.
+ * Identical to `serializeEmbedding` but attaches codec_schema_version and
+ * encoded_at so cache readers can distinguish old entries from new ones.
+ */
+export function serializeEmbeddingVersioned(
+  embedding: number[],
+  format: string,
+  registry: EmbeddingCodecRegistry = globalCodecRegistry,
+): { data_b64: string; meta: VersionedEmbeddingCodecMeta } {
+  const { data_b64, meta } = serializeEmbedding(embedding, format, registry);
+  return {
+    data_b64,
+    meta: {
+      ...meta,
+      codec_schema_version: CODEC_SCHEMA_VERSION,
+      encoded_at: new Date().toISOString(),
+    },
+  };
+}
+
+/**
+ * Detect whether a cache entry was written by an older codec schema version.
+ * Returns true when the entry needs re-encoding with the current codec.
+ *
+ * An entry is considered stale when:
+ *  - It has no `codec_schema_version` (written before v2), OR
+ *  - Its `codec_schema_version` is less than CODEC_SCHEMA_VERSION.
+ */
+export function isCodecVersionStale(
+  meta: Partial<VersionedEmbeddingCodecMeta> | undefined,
+): boolean {
+  if (!meta) return true;
+  const v = meta.codec_schema_version;
+  if (v === undefined || v === null) return true;
+  return v < CODEC_SCHEMA_VERSION;
+}
+
+/**
+ * Migrate a legacy EmbeddingCodecMeta (v1) to a VersionedEmbeddingCodecMeta.
+ * Used when re-reading old cache files that lack the version field.
+ */
+export function upgradeCodecMeta(
+  meta: Partial<EmbeddingCodecMeta> | undefined,
+): VersionedEmbeddingCodecMeta {
+  return {
+    codec_format: meta?.codec_format ?? "float32",
+    codec_version: meta?.codec_version ?? 1,
+    codec_schema_version: meta?.codec_format ? 1 : undefined,
+    encoded_at: undefined,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Codec Affinity Tracking
+// ---------------------------------------------------------------------------
+
+/**
+ * Section type buckets used for per-section codec affinity tracking.
+ *
+ * Topic-cluster bucketing maps section paths/titles to one of these canonical
+ * categories so the system can learn which codec performs best per category
+ * (e.g. "architecture" sections may tolerate bfloat16 while "api" sections need int16).
+ */
+export type SectionTypeBucket =
+  | "architecture"
+  | "api"
+  | "test-fixtures"
+  | "config"
+  | "prose"
+  | "code"
+  | "data"
+  | "unknown";
+
+/**
+ * A single A/B quality observation for a (sectionType, codec) pair.
+ * Recorded each time a retrieval completes with measurable quality signals.
+ */
+export interface CodecAffinityRecord {
+  /** Section type bucket this observation applies to. */
+  sectionType: SectionTypeBucket;
+  /** Codec format used for this retrieval. */
+  codecFormat: string;
+  /**
+   * Mean absolute error of reconstruction vs float32 baseline for this entry.
+   * Lower = better fidelity.
+   */
+  reconstructionMae: number;
+  /**
+   * Normalized Discounted Cumulative Gain @ 5 measured for this retrieval.
+   * Range [0, 1]; null when not measured.
+   */
+  ndcgAt5: number | null;
+  /** ISO timestamp of the observation. */
+  observedAt: string;
+  /** Retrieval latency in ms (for ROI weighting). */
+  latencyMs: number;
+}
+
+/**
+ * Aggregated affinity summary for a (sectionType, codec) pair.
+ * Built from a window of CodecAffinityRecords.
+ */
+export interface CodecAffinitySummary {
+  sectionType: SectionTypeBucket;
+  codecFormat: string;
+  sampleCount: number;
+  avgReconstructionMae: number;
+  avgNdcgAt5: number | null;
+  avgLatencyMs: number;
+  /**
+   * Composite affinity score: avgNdcgAt5 - avgReconstructionMae * 10
+   * Higher = better fit for this section type.
+   * Null when no NDCG observations are available.
+   */
+  affinityScore: number | null;
+}
+
+/**
+ * In-memory codec affinity store.
+ *
+ * Tracks which codec(s) work best for each section type by maintaining a
+ * rolling window of CodecAffinityRecords and computing per-(type, codec)
+ * aggregate statistics on demand.
+ *
+ * Typical usage:
+ *   const store = new CodecAffinityStore();
+ *   store.record({ sectionType: "api", codecFormat: "int16", ... });
+ *   const best = store.getBestCodec("api");  // → "int16"
+ *   const aff  = store.getAffinityMap();     // → Map<sectionType, summary[]>
+ */
+export class CodecAffinityStore {
+  private readonly _records: CodecAffinityRecord[] = [];
+  private readonly _windowSize: number;
+
+  constructor(windowSize = 200) {
+    this._windowSize = windowSize;
+  }
+
+  /**
+   * Record a new codec quality observation.
+   * Evicts the oldest record when the window is full (FIFO).
+   */
+  record(obs: Omit<CodecAffinityRecord, "observedAt">): void {
+    if (this._records.length >= this._windowSize) {
+      this._records.shift();
+    }
+    this._records.push({ ...obs, observedAt: new Date().toISOString() });
+  }
+
+  /**
+   * Return all records for a given section type.
+   */
+  getRecords(sectionType: SectionTypeBucket): CodecAffinityRecord[] {
+    return this._records.filter((r) => r.sectionType === sectionType);
+  }
+
+  /**
+   * Return the codec with the highest affinity score for a given section type.
+   * Returns null when no observations exist for that type.
+   *
+   * @param sectionType  Section bucket to query.
+   * @param minSamples   Minimum observations required per codec (default 3).
+   */
+  getBestCodec(sectionType: SectionTypeBucket, minSamples = 3): string | null {
+    const summaries = this._summarize(sectionType);
+    const eligible = summaries
+      .filter((s) => s.sampleCount >= minSamples && s.affinityScore !== null)
+      .sort((a, b) => (b.affinityScore ?? -Infinity) - (a.affinityScore ?? -Infinity));
+    return eligible[0]?.codecFormat ?? null;
+  }
+
+  /**
+   * Return per-(sectionType, codec) affinity summaries for all observed types.
+   * Keyed by section type; values are sorted by affinityScore descending.
+   */
+  getAffinityMap(): Map<SectionTypeBucket, CodecAffinitySummary[]> {
+    const types = new Set(this._records.map((r) => r.sectionType));
+    const result = new Map<SectionTypeBucket, CodecAffinitySummary[]>();
+    for (const t of types) {
+      const summaries = this._summarize(t).sort(
+        (a, b) => (b.affinityScore ?? -Infinity) - (a.affinityScore ?? -Infinity),
+      );
+      result.set(t, summaries);
+    }
+    return result;
+  }
+
+  /** Total number of observations in the window. */
+  get size(): number {
+    return this._records.length;
+  }
+
+  /** Reset the store (for testing). */
+  clear(): void {
+    this._records.splice(0, this._records.length);
+  }
+
+  // ── Private ──────────────────────────────────────────────────────────────
+
+  private _summarize(sectionType: SectionTypeBucket): CodecAffinitySummary[] {
+    const byCodec = new Map<string, CodecAffinityRecord[]>();
+    for (const r of this._records) {
+      if (r.sectionType !== sectionType) continue;
+      const arr = byCodec.get(r.codecFormat) ?? [];
+      arr.push(r);
+      byCodec.set(r.codecFormat, arr);
+    }
+
+    const summaries: CodecAffinitySummary[] = [];
+    for (const [codecFormat, recs] of byCodec) {
+      const n = recs.length;
+      const avgReconstructionMae = recs.reduce((s, r) => s + r.reconstructionMae, 0) / n;
+      const avgLatencyMs = recs.reduce((s, r) => s + r.latencyMs, 0) / n;
+
+      const withNdcg = recs.filter((r) => r.ndcgAt5 !== null);
+      const avgNdcgAt5 =
+        withNdcg.length > 0
+          ? withNdcg.reduce((s, r) => s + (r.ndcgAt5 as number), 0) / withNdcg.length
+          : null;
+
+      const affinityScore =
+        avgNdcgAt5 !== null ? avgNdcgAt5 - avgReconstructionMae * 10 : null;
+
+      summaries.push({
+        sectionType,
+        codecFormat,
+        sampleCount: n,
+        avgReconstructionMae,
+        avgNdcgAt5,
+        avgLatencyMs,
+        affinityScore,
+      });
+    }
+    return summaries;
+  }
+}
+
+/**
+ * Global singleton affinity store (shared across QuantizationNegotiator instances
+ * within the same process). Tests should call `.clear()` between runs.
+ */
+export const globalCodecAffinityStore = new CodecAffinityStore();
+
+// ---------------------------------------------------------------------------
+// Section type bucketing
+// ---------------------------------------------------------------------------
+
+/**
+ * Classify a section path/title into one of the canonical SectionTypeBucket values.
+ *
+ * Rules (applied in priority order):
+ *  1. Path contains "test" or "fixture" → "test-fixtures"
+ *  2. Path contains "api", "interface", "schema", "contract" → "api"
+ *  3. Path contains "arch", "design", "overview", "vision" → "architecture"
+ *  4. Path contains "config", "setting", "env", ".toml", ".yaml", ".json" → "config"
+ *  5. Path ends with a code extension (.ts, .js, .py, etc.) → "code"
+ *  6. Title or path contains "data", "fixture", "seed", "mock" → "data"
+ *  7. Default → "prose"
+ */
+export function classifySectionType(
+  sectionPath: string,
+  title?: string,
+): SectionTypeBucket {
+  const lower = (sectionPath + " " + (title ?? "")).toLowerCase();
+
+  if (/test|fixture/.test(lower)) return "test-fixtures";
+  if (/\bapi\b|interface|schema|contract|protocol/.test(lower)) return "api";
+  if (/arch|design|overview|vision|north.?star/.test(lower)) return "architecture";
+  if (/\bdata\b|seed|mock/.test(lower)) return "data";
+  if (/config|setting|env|\.toml|\.yaml|\.yml|\.json/.test(lower)) return "config";
+  if (/\.(ts|js|tsx|jsx|py|go|rs|java|cpp|c|rb|php|swift|kt|cs)\b/.test(lower)) return "code";
+  return "prose";
+}
