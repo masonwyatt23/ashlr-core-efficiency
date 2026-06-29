@@ -21,6 +21,18 @@
  * balancing USD cost against end-user latency.
  */
 
+// Re-export the provider cost ratio oracle.
+export type {
+  CalibratedRate,
+  ProviderRateRecord,
+} from "./provider-cost-oracle.ts";
+export {
+  EMA_ALPHA,
+  MAX_CACHE_AGE_MS,
+  MAX_CACHE_RECORDS,
+  ProviderCostOracle,
+} from "./provider-cost-oracle.ts";
+
 // Re-export the adaptive multi-objective learner and its public API.
 export type {
   BudgetAllocation,
