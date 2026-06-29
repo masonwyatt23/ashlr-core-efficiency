@@ -451,6 +451,29 @@ export interface EmbeddingRouterOptions extends ModelSelectionOptions {
    * Defaults to false to preserve backward compatibility.
    */
   enableQuantizationStrategy?: boolean;
+  /**
+   * Optional EmbeddingProviderRegistry from embedding-resilience.ts.
+   *
+   * When provided, `embed()` delegates to the registry's multi-tier fallback
+   * chain (Tier1=Ollama, Tier2=OpenAI, Tier3=TF-IDF) instead of the Ollama-only
+   * cascade.  Circuit breakers and strategy-event persistence are managed by the
+   * registry / ResilientProviderPipeline.
+   *
+   * Pass `parseEmbeddingProviderFlag(argv["--embedding-provider"])` as
+   * `providerOverride` to honour the CLI flag.
+   */
+  providerRegistry?: import("./embedding-resilience.ts").EmbeddingProviderRegistry;
+  /**
+   * Force a specific provider name (e.g. from --embedding-provider CLI flag).
+   * Passed through to `ResilientProviderPipeline` when a `providerRegistry` is
+   * configured.  Ignored when no registry is set.
+   */
+  providerOverride?: string;
+  /**
+   * Working directory for ResilientProviderPipeline event persistence.
+   * Defaults to `cwd` when not specified.
+   */
+  providerCwd?: string;
 }
 
 /**
@@ -486,6 +509,14 @@ export class EmbeddingRouter {
   private readonly cwd: string;
   private readonly options: Required<ModelSelectionOptions>;
   private readonly strategyEngine: QuantizationStrategyEngine | null;
+  /** Optional multi-tier provider registry (Ollama → OpenAI → TF-IDF). */
+  private readonly providerRegistry:
+    | import("./embedding-resilience.ts").EmbeddingProviderRegistry
+    | null;
+  /** Forced provider name from --embedding-provider CLI flag. */
+  private readonly providerOverride: string | undefined;
+  /** cwd for ResilientProviderPipeline event persistence. */
+  private readonly providerCwd: string;
 
   constructor(cwd: string, options: EmbeddingRouterOptions = {}) {
     this.cwd = cwd;
@@ -497,6 +528,9 @@ export class EmbeddingRouter {
     this.strategyEngine = options.enableQuantizationStrategy
       ? new QuantizationStrategyEngine(cwd)
       : null;
+    this.providerRegistry = options.providerRegistry ?? null;
+    this.providerOverride = options.providerOverride;
+    this.providerCwd = options.providerCwd ?? cwd;
   }
 
   /**
@@ -558,18 +592,23 @@ export class EmbeddingRouter {
    * Generate an embedding for `text`, routing to the best model for the
    * query's complexity.  Records the outcome automatically.
    *
+   * When a `providerRegistry` is configured, delegates to the multi-tier
+   * fallback chain (Tier1=Ollama → Tier2=OpenAI → Tier3=TF-IDF) via
+   * `ResilientProviderPipeline`.  The `--embedding-provider` flag value
+   * (passed as `providerOverride`) is forwarded to pin a specific tier.
+   *
    * When `enableQuantizationStrategy` is true, also selects the optimal
    * quantization bit-depth and attaches it to the result as
    * `selectedQuantizationDepth` + `quantizationOutcomeId`.
    *
-   * Returns null when Ollama is unavailable or the full cascade is exhausted.
+   * Returns null when Ollama is unavailable or the full cascade is exhausted
+   * (only possible when no providerRegistry is set and no ultrafast fallback
+   * is reached).
    */
   async embed(
     query: string,
     text: string,
   ): Promise<EmbeddingResult | null> {
-    if (!(await isOllamaAvailable())) return null;
-
     // ── Quantization strategy selection (before model tier choice) ────────
     let selectedQuantizationDepth: QuantizationBitDepth | undefined;
     let quantizationOutcomeId: string | undefined;
@@ -579,6 +618,53 @@ export class EmbeddingRouter {
       selectedQuantizationDepth = stratResult.bitDepth;
       quantizationOutcomeId = stratResult.outcomeId;
     }
+
+    // ── Multi-tier provider registry path (Ollama → OpenAI → TF-IDF) ─────
+    if (this.providerRegistry !== null) {
+      const {
+        ResilientProviderPipeline,
+      } = await import("./embedding-resilience.ts");
+      const pipeline = new ResilientProviderPipeline(this.providerRegistry, {
+        cwd: this.providerCwd,
+        disablePersistence: false,
+        forcedProvider: this.providerOverride,
+      });
+      const providerResult = await pipeline.embed(text);
+      const embedding = providerResult.embedding;
+
+      // Map provider tier to a synthetic model name for compatibility
+      const modelName: EmbeddingModelName =
+        providerResult.tier === 1
+          ? "nomic-embed-text"
+          : providerResult.tier === 2
+            ? "nomic-embed-text"
+            : "ultrafast";
+
+      // Record model outcome for learning continuity
+      const complexity = classifyQueryComplexity(query);
+      await recordModelOutcome(this.cwd, {
+        modelName,
+        queryComplexity: complexity,
+        latencyMs: providerResult.totalLatencyMs,
+        succeeded: embedding.length > 0,
+        topSimilarity: 0,
+        matchQuality: null,
+      });
+
+      const embeddingResult: EmbeddingResult = {
+        embedding,
+        modelName,
+        latencyMs: providerResult.totalLatencyMs,
+        usedFallback: providerResult.usedFallback,
+        usedUltrafast: providerResult.tier === 3,
+        ...(selectedQuantizationDepth !== undefined ? { selectedQuantizationDepth } : {}),
+        ...(quantizationOutcomeId !== undefined ? { quantizationOutcomeId } : {}),
+      };
+      return embeddingResult;
+    }
+
+    // ── Legacy Ollama-only path ───────────────────────────────────────────
+    if (!(await isOllamaAvailable())) return null;
 
     // ── Model tier selection ──────────────────────────────────────────────
     const complexity = classifyQueryComplexity(query);
