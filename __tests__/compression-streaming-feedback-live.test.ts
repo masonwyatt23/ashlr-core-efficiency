@@ -1077,15 +1077,15 @@ describe("regret-learner UCB bandit — deterministic tier selection", () => {
     expect([3, 4] as number[]).toContain(tier);
   });
 
-  test("computeTierCostAnalysis byTier covers tiers 1–4 (and 5 with zeroed stats)", () => {
+  test("computeTierCostAnalysis byTier covers tiers 1–4", () => {
     recordTierOutcome(2, 300, "claude-sonnet");
     const analysis = computeTierCostAnalysis();
-    // All 5 tiers must be present so byTier[recommendedTier] is never undefined.
+    // All four compression tiers must be present so byTier[recommendedTier]
+    // is never undefined.
     expect(analysis.byTier[1]).toBeDefined();
     expect(analysis.byTier[2]).toBeDefined();
     expect(analysis.byTier[3]).toBeDefined();
     expect(analysis.byTier[4]).toBeDefined();
-    expect(analysis.byTier[5]).toBeDefined();
   });
 
   test("computeTierCostAnalysis recommendedTier is always in [1,2,3,4]", () => {
