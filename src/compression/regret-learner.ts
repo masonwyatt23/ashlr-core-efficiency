@@ -29,6 +29,9 @@
  * `pipeCompressionCostToLearner()`, which is wired into `recordCompressionCost`.
  */
 
+import { writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { CompressionTier } from "./context.ts";
 import { defaultProviderRate } from "../tokens/index.ts";
 
@@ -152,10 +155,10 @@ export interface TierCostAnalysis {
 const _window: TierOutcome[] = [];
 
 /** Per-tier EMA regret (updated incrementally). */
-const _emaRegret: Record<CompressionTier, number> = { 1: 0, 2: 0, 3: 0, 4: 0 };
+const _emaRegret: Record<CompressionTier, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
 
 /** Per-tier all-time pull count (for UCB denominator). Not windowed. */
-const _totalPulls: Record<CompressionTier, number> = { 1: 0, 2: 0, 3: 0, 4: 0 };
+const _totalPulls: Record<CompressionTier, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
 
 /** Total outcomes recorded (for UCB ln(N)). Not windowed. */
 let _totalOutcomes = 0;
@@ -171,10 +174,12 @@ export function _resetLearner(): void {
   _emaRegret[2] = 0;
   _emaRegret[3] = 0;
   _emaRegret[4] = 0;
+  _emaRegret[5] = 0;
   _totalPulls[1] = 0;
   _totalPulls[2] = 0;
   _totalPulls[3] = 0;
   _totalPulls[4] = 0;
+  _totalPulls[5] = 0;
   _totalOutcomes = 0;
 }
 
@@ -240,6 +245,11 @@ export function computeTierCost(
       // reflecting that it removes whole branches rather than per-message truncation.
       return tokensRemoved * rate.inputRate * 0.003;
     }
+    case 5: {
+      // validateAndMeasure: zero compression — no tokens removed, no LLM call.
+      // Cost is effectively zero; the only overhead is the hash pass (negligible).
+      return 0;
+    }
   }
 }
 
@@ -284,6 +294,7 @@ export function recordTierOutcome(
     2: computeTierCost(2, tokensRemoved, provider),
     3: computeTierCost(3, tokensRemoved, provider),
     4: computeTierCost(4, tokensRemoved, provider),
+    5: computeTierCost(5, tokensRemoved, provider),
   };
 
   const selectedCost = allCosts[selectedTier];
@@ -350,21 +361,26 @@ export function pipeCompressionCostToLearner(
  * the algorithm will try them before settling on an exploit decision.
  *
  * Returns the tier with the lowest UCB score (minimum expected cost).
- * Falls back to tier 3 (lightest compression) when no data is available.
+ * Falls back to tier 4 (treeCompact — lightest real compression) when no
+ * data is available.  Tier 5 (validateAndMeasure) is intentionally excluded
+ * from the UCB recommendation set: it performs zero compression and is
+ * managed by the adaptive selector's fill-ratio fast-path, not by the bandit.
  *
  * @param windowOutcomes  Outcomes to base the decision on (defaults to internal window).
- * @returns               Recommended tier.
+ * @returns               Recommended tier ∈ {1, 2, 3, 4} — always valid.
  */
 export function selectTierUCB(
   windowOutcomes?: readonly TierOutcome[],
 ): CompressionTier {
   const outcomes = windowOutcomes ?? _window;
 
+  // Empty window: default to tier 4 (lightest real compression tier).
   if (outcomes.length === 0) return 4;
 
-  // Aggregate per-tier stats from outcomes.
-  const counts: Record<CompressionTier, number> = { 1: 0, 2: 0, 3: 0, 4: 0 };
-  const totalCosts: Record<CompressionTier, number> = { 1: 0, 2: 0, 3: 0, 4: 0 };
+  // Aggregate per-tier stats from outcomes.  Only track tiers 1-4: the bandit
+  // does not manage tier 5 (validateAndMeasure = no-op).
+  const counts: Record<CompressionTier, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+  const totalCosts: Record<CompressionTier, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
 
   for (const o of outcomes) {
     counts[o.selectedTier]++;
@@ -373,8 +389,9 @@ export function selectTierUCB(
 
   const N = outcomes.length;
 
-  // Phase 1: if any tier has fewer than MIN_UCB_SAMPLES, explore it first.
-  // Prefer higher tier numbers (lighter compression) for exploration order.
+  // Phase 1: if any actionable tier (1–4) has fewer than MIN_UCB_SAMPLES,
+  // explore it first.  Prefer lighter tiers (higher number) for exploration
+  // order so we don't open with the most expensive tier.
   for (const t of [4, 3, 2, 1] as CompressionTier[]) {
     if (counts[t] < MIN_UCB_SAMPLES) {
       return t;
@@ -382,6 +399,8 @@ export function selectTierUCB(
   }
 
   // Phase 2: all tiers sufficiently explored — pick minimum UCB score.
+  // Default to tier 4 so we always return a valid value even if the loop
+  // produces no improvement over Infinity.
   let bestTier: CompressionTier = 4;
   let bestScore = Infinity;
 
@@ -421,7 +440,7 @@ export function computeTierCostAnalysis(
   const N = outcomes.length;
 
   // Bucket by selected tier.
-  const buckets: Record<CompressionTier, TierOutcome[]> = { 1: [], 2: [], 3: [], 4: [] };
+  const buckets: Record<CompressionTier, TierOutcome[]> = { 1: [], 2: [], 3: [], 4: [], 5: [] };
   for (const o of outcomes) {
     buckets[o.selectedTier].push(o);
   }
@@ -435,7 +454,10 @@ export function computeTierCostAnalysis(
 
   const byTier = {} as Record<CompressionTier, TierStats>;
 
-  for (const t of [1, 2, 3, 4] as CompressionTier[]) {
+  // Build stats for tiers 1–4 (active compression tiers tracked by the bandit).
+  // Tier 5 (validateAndMeasure) is also included with zeroed stats so that
+  // callers can always safely index byTier[5] without an undefined crash.
+  for (const t of [1, 2, 3, 4, 5] as CompressionTier[]) {
     const bucket = buckets[t];
     const pullCount = bucket.length;
 
@@ -457,8 +479,11 @@ export function computeTierCostAnalysis(
     }
 
     // UCB score for this tier.
+    // Tier 5 is not managed by the bandit; give it a neutral score of 0.
     let ucbScore: number;
-    if (pullCount < MIN_UCB_SAMPLES) {
+    if (t === 5) {
+      ucbScore = 0;
+    } else if (pullCount < MIN_UCB_SAMPLES) {
       ucbScore = pullCount === 0 ? -Infinity : -1e6; // force exploration
     } else {
       const exploration = UCB_C * Math.sqrt(Math.log(N + 1) / pullCount);
@@ -469,7 +494,9 @@ export function computeTierCostAnalysis(
     const emaRegret = _emaRegret[t];
     // Only flag a tier as exceeding the threshold when it has been observed at
     // least MIN_UCB_SAMPLES times — unexplored tiers should never trigger a shift.
+    // Tier 5 never triggers a shift (it performs no compression).
     const exceedsRegretThreshold =
+      t !== 5 &&
       pullCount >= MIN_UCB_SAMPLES &&
       meanIdealCost > 0 &&
       emaRegret > REGRET_THRESHOLD * meanIdealCost;
@@ -486,6 +513,7 @@ export function computeTierCostAnalysis(
   }
 
   // Recommended tier — delegate entirely to selectTierUCB for consistency.
+  // selectTierUCB always returns a value in {1,2,3,4}; never tier 5.
   const recommendedTier: CompressionTier = selectTierUCB(outcomes);
 
   // Build recommendation string.
@@ -503,7 +531,10 @@ export function computeTierCostAnalysis(
     const pct = (byTier[highRegretTiers[0]!].emaRegret / (meanIdealCost || 1)) * 100;
     recommendation = `Shift recommended — tier ${highRegretTiers[0]} EMA regret is ${pct.toFixed(1)}% above ideal. Recommended: tier ${recommendedTier}.`;
   } else {
-    recommendation = `No shift needed. Recommended tier: ${recommendedTier} (UCB score: ${byTier[recommendedTier].ucbScore.toFixed(6)}).`;
+    // byTier[recommendedTier] is always defined: selectTierUCB returns 1–4,
+    // and byTier now covers all five tiers.
+    const recStats = byTier[recommendedTier];
+    recommendation = `No shift needed. Recommended tier: ${recommendedTier} (UCB score: ${recStats.ucbScore.toFixed(6)}).`;
   }
 
   return {
@@ -522,8 +553,121 @@ export function computeTierCostAnalysis(
 
 /**
  * Convenience wrapper: return the UCB-recommended tier given current window state.
- * Returns tier 3 (cheapest) when no data is available.
+ * Always returns a valid tier ∈ {1,2,3,4}.  Tier 4 (treeCompact) is the safe
+ * fallback when the window is empty or all tiers are under-explored.
  */
 export function getRecommendedTier(): CompressionTier {
   return selectTierUCB(_window);
+}
+
+// ---------------------------------------------------------------------------
+// Daily calibration report
+// ---------------------------------------------------------------------------
+
+/**
+ * Shape of the compression bandit calibration report written to
+ * `~/.ashlr/compression-bandit-report.json`.
+ */
+export interface CompressionBanditReport {
+  /** ISO timestamp when the report was generated. */
+  generatedAt: string;
+  /** Number of outcomes in the current learner window. */
+  windowSize: number;
+  /** Recommended tier for the next compression call (always 1–4). */
+  recommendedTier: CompressionTier;
+  /** Per-tier summary statistics. */
+  tierSummary: Array<{
+    tier: CompressionTier;
+    pullCount: number;
+    avgCost: number;
+    emaRegret: number;
+    ucbScore: number;
+    exceedsRegretThreshold: boolean;
+    /** Estimated LLM tokens saved per call vs no compression (proxy metric). */
+    estimatedTokensSavedPerCall: number;
+  }>;
+  /** True when at least one tier's EMA regret exceeds the threshold. */
+  shiftRecommended: boolean;
+  /** Human-readable recommendation string from the cost analysis. */
+  recommendation: string;
+  /** Total regret accumulated across the current window (lower is better). */
+  totalWindowRegret: number;
+  /** Average latency cost proxy: sum of all costs in window / windowSize. */
+  avgCostPerCall: number;
+}
+
+/**
+ * Emit a daily calibration report to `~/.ashlr/compression-bandit-report.json`.
+ *
+ * The report captures:
+ * - LLM tokens saved vs latency cost (per tier)
+ * - UCB recommendations and regret thresholds
+ * - Window statistics for visibility into the live bandit state
+ *
+ * Write is best-effort: I/O errors are swallowed so this never breaks the
+ * compression pipeline.  Safe to call at any time; the file is overwritten
+ * (not appended) so the report always reflects the latest learner state.
+ *
+ * @param outputPath  Override the output path (default: `~/.ashlr/compression-bandit-report.json`).
+ *                    Useful in tests.
+ * @returns           The report object that was written (or null on error).
+ */
+export function emitDailyCalibrationReport(
+  outputPath?: string,
+): CompressionBanditReport | null {
+  try {
+    const analysis = computeTierCostAnalysis();
+    const windowOutcomes = _getWindow();
+
+    // Compute total window regret and average cost per call.
+    let totalWindowRegret = 0;
+    let totalWindowCost = 0;
+    for (const o of windowOutcomes) {
+      totalWindowRegret += o.regret;
+      totalWindowCost += o.selectedCost;
+    }
+    const avgCostPerCall =
+      windowOutcomes.length > 0 ? totalWindowCost / windowOutcomes.length : 0;
+
+    // Build per-tier summary.  For each tier, estimate tokens saved per call
+    // as a proxy: cost / inputRate ≈ tokens removed (using a neutral rate).
+    const NEUTRAL_INPUT_RATE = 3e-6; // ~$3/M tokens — anthropic mid-tier
+    const tierSummary = ([1, 2, 3, 4] as CompressionTier[]).map((t) => {
+      const stats = analysis.byTier[t];
+      const estimatedTokensSavedPerCall =
+        stats.avgCost > 0 ? Math.round(stats.avgCost / NEUTRAL_INPUT_RATE) : 0;
+      return {
+        tier: t,
+        pullCount: stats.pullCount,
+        avgCost: stats.avgCost,
+        emaRegret: stats.emaRegret,
+        ucbScore: stats.ucbScore,
+        exceedsRegretThreshold: stats.exceedsRegretThreshold,
+        estimatedTokensSavedPerCall,
+      };
+    });
+
+    const report: CompressionBanditReport = {
+      generatedAt: new Date().toISOString(),
+      windowSize: analysis.windowSize,
+      recommendedTier: analysis.recommendedTier,
+      tierSummary,
+      shiftRecommended: analysis.shiftRecommended,
+      recommendation: analysis.recommendation,
+      totalWindowRegret,
+      avgCostPerCall,
+    };
+
+    const filePath = outputPath ?? join(homedir(), ".ashlr", "compression-bandit-report.json");
+    const dir = filePath.substring(0, filePath.lastIndexOf("/"));
+    if (dir && !existsSync(dir)) {
+      mkdirSync(dir, { recursive: true });
+    }
+    writeFileSync(filePath, JSON.stringify(report, null, 2) + "\n", { flag: "w" });
+
+    return report;
+  } catch {
+    // Best-effort — never throw from a reporting path.
+    return null;
+  }
 }

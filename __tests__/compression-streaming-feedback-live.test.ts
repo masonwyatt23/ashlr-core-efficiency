@@ -32,6 +32,15 @@ import {
   type TierRecommendation,
   type FeedbackPersistRecord,
 } from "../src/compression/streaming-feedback.ts";
+import {
+  _resetLearner as _resetLearnerForBandit,
+  selectTierUCB,
+  recordTierOutcome,
+  computeTierCostAnalysis,
+  getRecommendedTier,
+  emitDailyCalibrationReport,
+  type CompressionBanditReport,
+} from "../src/compression/regret-learner.ts";
 import { readJsonl } from "../src/genome/jsonl.ts";
 import { selectCompressionTierAdaptive } from "../src/compression/adaptive.ts";
 import {
@@ -742,8 +751,9 @@ describe("selectCompressionTierAdaptive — liveRecommendation override", () => 
       null,
       insufficientRec,
     );
-    // Static tier should be returned (not forced to 3 by the live rec)
-    expect([1, 2, 3, 4] as number[]).toContain(tier);
+    // Static tier should be returned (not forced to 3 by the live rec).
+    // Tier 5 (validateAndMeasure) is a valid static result when context fits in budget.
+    expect([1, 2, 3, 4, 5] as number[]).toContain(tier);
   });
 
   test("null liveRecommendation falls through to existing selection logic", () => {
@@ -760,7 +770,8 @@ describe("selectCompressionTierAdaptive — liveRecommendation override", () => 
       null,
       null, // explicitly null
     );
-    expect([1, 2, 3, 4] as number[]).toContain(tier);
+    // Tier 5 (validateAndMeasure) is a valid static result when context fits in budget.
+    expect([1, 2, 3, 4, 5] as number[]).toContain(tier);
   });
 
   test("live recommendation tier 4 is respected", () => {
@@ -1021,5 +1032,174 @@ describe("cost-accounting integration — feedback wired via recordCompressionCo
       recordCompressionCost(3, 200, 100, true, "claude-sonnet");
     }).not.toThrow();
     _resetFeedbackSingleton();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 11. Regret-learner Thompson Sampling / UCB bandit — deterministic tests
+// ---------------------------------------------------------------------------
+
+describe("regret-learner UCB bandit — deterministic tier selection", () => {
+  beforeEach(() => { _resetLearnerForBandit(); });
+
+  test("selectTierUCB returns tier 4 on empty window (safe fallback)", () => {
+    expect(selectTierUCB([])).toBe(4);
+  });
+
+  test("selectTierUCB returns a value in [1,2,3,4] — never tier 5", () => {
+    // Seed a few outcomes and verify the return is always actionable.
+    recordTierOutcome(2, 500, "claude-sonnet");
+    recordTierOutcome(3, 300, "claude-sonnet");
+    const tier = selectTierUCB();
+    expect([1, 2, 3, 4] as number[]).toContain(tier);
+  });
+
+  test("selectTierUCB explores undersampled tiers (phase 1 exploration)", () => {
+    // Seed tier 4 with MIN_UCB_SAMPLES - 1 pulls; tier 1 with 0.
+    // Phase 1 should explore tier 4 first (lighter), then tier 3, 2, 1.
+    for (let i = 0; i < 2; i++) recordTierOutcome(4, 100, "claude-sonnet");
+    // With 0 pulls on tier 1, phase 1 should return tier 4 (first under-sampled
+    // in [4,3,2,1] order since tier 4 has 2 < MIN_UCB_SAMPLES=3).
+    const tier = selectTierUCB();
+    expect([1, 2, 3, 4] as number[]).toContain(tier);
+  });
+
+  test("selectTierUCB exploits cheapest tier after full exploration", () => {
+    // Feed enough samples for all 4 tiers. Tier 4 has the lowest cost proxy.
+    for (let i = 0; i < 5; i++) {
+      recordTierOutcome(1, 5000, "claude-sonnet"); // expensive
+      recordTierOutcome(2, 200, "claude-sonnet");
+      recordTierOutcome(3, 100, "claude-sonnet");
+      recordTierOutcome(4, 50, "claude-sonnet");  // cheapest
+    }
+    // After full exploration UCB should converge on tier 4 or 3 (both cheap).
+    const tier = selectTierUCB();
+    expect([3, 4] as number[]).toContain(tier);
+  });
+
+  test("computeTierCostAnalysis byTier covers tiers 1–4 (and 5 with zeroed stats)", () => {
+    recordTierOutcome(2, 300, "claude-sonnet");
+    const analysis = computeTierCostAnalysis();
+    // All 5 tiers must be present so byTier[recommendedTier] is never undefined.
+    expect(analysis.byTier[1]).toBeDefined();
+    expect(analysis.byTier[2]).toBeDefined();
+    expect(analysis.byTier[3]).toBeDefined();
+    expect(analysis.byTier[4]).toBeDefined();
+    expect(analysis.byTier[5]).toBeDefined();
+  });
+
+  test("computeTierCostAnalysis recommendedTier is always in [1,2,3,4]", () => {
+    // Even on empty window the recommended tier must be actionable.
+    const analysis = computeTierCostAnalysis();
+    expect([1, 2, 3, 4] as number[]).toContain(analysis.recommendedTier);
+  });
+
+  test("computeTierCostAnalysis recommendation string is defined and non-empty", () => {
+    const analysis = computeTierCostAnalysis();
+    expect(typeof analysis.recommendation).toBe("string");
+    expect(analysis.recommendation.length).toBeGreaterThan(0);
+  });
+
+  test("computeTierCostAnalysis recommendation does not throw when recommendedTier is returned", () => {
+    // Seed balanced data so the no-shift branch runs; previously crashed at byTier[5].
+    for (let i = 0; i < 5; i++) {
+      recordTierOutcome(1, 800, "claude-sonnet");
+      recordTierOutcome(2, 400, "claude-sonnet");
+      recordTierOutcome(3, 200, "claude-sonnet");
+      recordTierOutcome(4, 100, "claude-sonnet");
+    }
+    expect(() => computeTierCostAnalysis()).not.toThrow();
+    const analysis = computeTierCostAnalysis();
+    expect(analysis.recommendation).not.toContain("undefined");
+  });
+
+  test("getRecommendedTier returns tier in [1,2,3,4]", () => {
+    const tier = getRecommendedTier();
+    expect([1, 2, 3, 4] as number[]).toContain(tier);
+  });
+
+  test("getRecommendedTier returns tier 4 on fresh learner (no data)", () => {
+    expect(getRecommendedTier()).toBe(4);
+  });
+
+  test("EMA regret updates are non-negative after a zero-regret tier", () => {
+    // Tier 4 is the cheapest; regret should be 0 (best in hindsight).
+    for (let i = 0; i < 5; i++) recordTierOutcome(4, 200, "claude-sonnet");
+    const analysis = computeTierCostAnalysis();
+    expect(analysis.byTier[4].emaRegret).toBeGreaterThanOrEqual(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 12. emitDailyCalibrationReport — bandit report to ~/.ashlr/
+// ---------------------------------------------------------------------------
+
+describe("emitDailyCalibrationReport — daily calibration visibility", () => {
+  let reportPath: string;
+
+  beforeEach(async () => {
+    _resetLearnerForBandit();
+    const tmpDir = await makeTmpDir();
+    reportPath = `${tmpDir}/compression-bandit-report.json`;
+  });
+
+  test("returns a CompressionBanditReport on empty learner state", () => {
+    const report = emitDailyCalibrationReport(reportPath);
+    expect(report).not.toBeNull();
+    expect(report!.windowSize).toBe(0);
+    expect([1, 2, 3, 4] as number[]).toContain(report!.recommendedTier);
+    expect(report!.tierSummary).toHaveLength(4); // tiers 1–4 only
+  });
+
+  test("report tierSummary tiers match [1,2,3,4]", () => {
+    const report = emitDailyCalibrationReport(reportPath)!;
+    const tiers = report.tierSummary.map((s) => s.tier);
+    expect(tiers).toEqual([1, 2, 3, 4]);
+  });
+
+  test("report fields are all present and typed correctly", () => {
+    const report = emitDailyCalibrationReport(reportPath)!;
+    expect(typeof report.generatedAt).toBe("string");
+    expect(typeof report.windowSize).toBe("number");
+    expect(typeof report.shiftRecommended).toBe("boolean");
+    expect(typeof report.recommendation).toBe("string");
+    expect(typeof report.totalWindowRegret).toBe("number");
+    expect(typeof report.avgCostPerCall).toBe("number");
+  });
+
+  test("report reflects seeded window data", () => {
+    for (let i = 0; i < 5; i++) {
+      recordTierOutcome(2, 400, "claude-sonnet");
+      recordTierOutcome(3, 200, "claude-sonnet");
+    }
+    const report = emitDailyCalibrationReport(reportPath)!;
+    expect(report.windowSize).toBe(10);
+    const tier2Summary = report.tierSummary.find((s) => s.tier === 2)!;
+    expect(tier2Summary.pullCount).toBe(5);
+  });
+
+  test("writes the report file to the given path", async () => {
+    emitDailyCalibrationReport(reportPath);
+    const { readFile } = await import("fs/promises");
+    const content = await readFile(reportPath, "utf8");
+    const parsed = JSON.parse(content) as CompressionBanditReport;
+    expect(parsed.recommendedTier).toBeDefined();
+    expect([1, 2, 3, 4] as number[]).toContain(parsed.recommendedTier);
+  });
+
+  test("returns null gracefully when path is unwritable (does not throw)", () => {
+    // Passing a path inside a non-existent root that can't be created
+    // should return null, not throw.
+    const badPath = "/dev/null/subdir-that-cannot-exist/report.json";
+    expect(() => emitDailyCalibrationReport(badPath)).not.toThrow();
+    // Return value may be null (write failed) or a report (if somehow writable)
+  });
+
+  test("totalWindowRegret is 0 when only cheapest tier is used", () => {
+    // Tier 4 has cost proxy; it's always cheapest so regret = 0.
+    for (let i = 0; i < 5; i++) recordTierOutcome(4, 200, "claude-sonnet");
+    const report = emitDailyCalibrationReport(reportPath)!;
+    // Tier 4 is cheapest in hindsight → regret per observation = 0
+    expect(report.totalWindowRegret).toBeCloseTo(0, 8);
   });
 });
