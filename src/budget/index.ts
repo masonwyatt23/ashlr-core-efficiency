@@ -4,6 +4,14 @@
  * Behavior preserved exactly: substring match + 100K default fallback,
  * matching ashlrcode/src/agent/context.ts behavior so tests pass against
  * either consumer.
+ *
+ * ### Consolidation integration
+ *
+ * `rebalanceBudgetOnSwitch` accepts an optional `cwd` parameter. When
+ * provided it calls `rebalanceBudgetOnSwitchHook` from
+ * `../compression/consolidation.ts` to emit a `CompressorRecommendation`
+ * based on cross-session history. The recommendation is attached to the
+ * returned `BudgetRebalanceResult` as `compressionRecommendation`.
  */
 
 /** System prompt gets this fraction of the provider's context limit. */
@@ -335,6 +343,20 @@ export interface BudgetRebalanceResult {
    * Negative means it shrank.
    */
   tokensFreed: number;
+  /**
+   * Compression recommendation from the cross-session consolidation profile,
+   * when `cwd` was provided to `rebalanceBudgetOnSwitch`.
+   *
+   * Contains the historically best tier for this project + provider pair,
+   * along with a rationale string and estimated ROI delta.
+   *
+   * `null` when no `cwd` was supplied or no history exists.
+   */
+  compressionRecommendation?: {
+    recommendedTier: number;
+    rationale: string;
+    estimatedRoiDelta: number;
+  } | null;
 }
 
 /**
@@ -399,5 +421,59 @@ export function rebalanceBudgetOnSwitch(
     newSystemBudget: newBudget,
     recommendedTier: shiftedTier,
     tokensFreed: newBudget - oldBudget,
+    compressionRecommendation: null,
   };
+}
+
+/**
+ * Async variant of `rebalanceBudgetOnSwitch` that additionally consults the
+ * cross-session compression history consolidation hook.
+ *
+ * Use this overload when a project `cwd` is available. It runs the same
+ * synchronous budget computation and then asynchronously emits a
+ * `CompressorRecommendation` based on historical tier performance for this
+ * project + provider combination. The recommendation is attached to the
+ * returned `BudgetRebalanceResult` as `compressionRecommendation`.
+ *
+ * Consolidation is best-effort: if the history file is absent or an I/O error
+ * occurs, the function resolves with `compressionRecommendation: null` rather
+ * than rejecting.
+ *
+ * @param oldProvider      The provider being switched away from.
+ * @param newProvider      The provider being switched to.
+ * @param currentMessages  Messages currently in the context window.
+ * @param cwd              Project working directory (genome root).
+ * @returns                Promise of BudgetRebalanceResult with compression recommendation.
+ */
+export async function rebalanceBudgetOnSwitchWithConsolidation(
+  oldProvider: string,
+  newProvider: string,
+  currentMessages: { role: string; content: string | unknown[] }[],
+  cwd: string,
+): Promise<BudgetRebalanceResult> {
+  const base = rebalanceBudgetOnSwitch(oldProvider, newProvider, currentMessages);
+
+  // Lazy import to avoid a circular-dependency at the module level.
+  // consolidation.ts imports from budget/index.ts (computeProviderCostRatio),
+  // so we must not import it at the top level here.
+  try {
+    const { rebalanceBudgetOnSwitchHook } = await import("../compression/consolidation.ts");
+    const rec = await rebalanceBudgetOnSwitchHook(
+      cwd,
+      oldProvider,
+      newProvider,
+      currentMessages.length,
+    );
+    return {
+      ...base,
+      compressionRecommendation: {
+        recommendedTier: rec.recommendedTier,
+        rationale: rec.rationale,
+        estimatedRoiDelta: rec.estimatedRoiDelta,
+      },
+    };
+  } catch {
+    // Consolidation is best-effort — never fail a provider switch.
+    return base;
+  }
 }

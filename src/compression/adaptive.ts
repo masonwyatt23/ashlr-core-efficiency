@@ -29,6 +29,7 @@ import { estimateTokensFromMessages } from "../tokens/index.ts";
 import { recordCompressionCost } from "../session-log/cost-accounting.ts";
 import { computeProviderCostRatio } from "../budget/index.ts";
 import type { Message } from "../types/index.ts";
+import type { CompressibleProfile } from "./consolidation.ts";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -396,6 +397,15 @@ export async function calibrateCompressionThresholds(
  *                      use lighter compression and more expensive providers use
  *                      more aggressive compression. Has no effect when
  *                      `history` is `null` (static path remains unchanged).
+ * @param consolidationProfile  Optional CompressibleProfile from
+ *                      `getCompressionProfile`. When supplied and the profile
+ *                      contains a ranked entry for `provider`, the
+ *                      dominance-rank #1 tier from the profile overrides the
+ *                      UCB/history-derived tier — but only when the profile
+ *                      has sufficient confidence (≥ MIN_SAMPLES_FOR_LEARNING
+ *                      observations). This allows cross-session compression
+ *                      history to bootstrap tier selection on provider switch,
+ *                      eliminating the per-project re-learn cost.
  */
 export function selectCompressionTierAdaptive(
   messages: Message[],
@@ -404,6 +414,7 @@ export function selectCompressionTierAdaptive(
   history?: LearnedThresholds | null,
   calibration?: CalibrationRecommendation | null,
   provider?: string | null,
+  consolidationProfile?: CompressibleProfile | null,
 ): CompressionTier {
   const cfg = { ...DEFAULT_CONFIG, ...config };
 
@@ -485,6 +496,22 @@ export function selectCompressionTierAdaptive(
       // A shift of +1 (pricier provider) means more aggressive → lower tier number.
       const shifted = (selectedTier - recommendedTierShift) as CompressionTier;
       selectedTier = Math.min(3, Math.max(1, shifted)) as CompressionTier;
+    }
+  }
+
+  // Apply cross-session consolidation profile when available.
+  // When the profile has a high-confidence dominance-rank #1 tier for the
+  // current provider, prefer it over the per-session learned tier.
+  // This bootstraps compression selection on provider switch without re-learning.
+  if (consolidationProfile && provider) {
+    const providerEntries = consolidationProfile.byProvider[provider];
+    if (providerEntries && providerEntries.length > 0) {
+      const top = providerEntries[0];
+      if (top !== undefined && top.sampleCount >= MIN_SAMPLES_FOR_LEARNING) {
+        // Consolidation profile has enough data: prefer its top-ranked tier.
+        // Clamp to valid range to be defensive.
+        selectedTier = Math.min(4, Math.max(1, top.tier)) as CompressionTier;
+      }
     }
   }
 
