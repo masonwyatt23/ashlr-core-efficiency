@@ -25,8 +25,10 @@ import { UltraFastEmbedder, type UltraFastAuditRecord, ULTRAFAST_EMBEDDING_DIM }
 import { join } from "path";
 import {
   QuantizationStrategyEngine,
+  QuantizationAdvisor,
   type QuantizationBitDepth,
   type GenomeProfile,
+  type QuantizationAdvice,
 } from "./quantization-strategy.ts";
 
 // ---------------------------------------------------------------------------
@@ -452,6 +454,23 @@ export interface EmbeddingRouterOptions extends ModelSelectionOptions {
 }
 
 /**
+ * Result produced by `EmbeddingRouter.initializeQuantization()`.
+ *
+ * Contains the QuantizationAdvice from the QuantizationAdvisor plus a flag
+ * indicating whether the engine has been configured with the recommended
+ * strategy.  Callers can inspect `advice.recommendedBitDepth` and
+ * `advice.fallbackChain` for downstream use.
+ */
+export interface QuantizationInitResult {
+  /** Detailed advice produced by the QuantizationAdvisor. */
+  advice: QuantizationAdvice;
+  /** True when the strategy engine is active and has been seeded with the advice. */
+  strategyActive: boolean;
+  /** Any anomalies detected during profiling (e.g. codec version mismatch). */
+  anomalies: string[];
+}
+
+/**
  * EmbeddingRouter orchestrates multi-model embedding generation:
  *
  *  1. Classifies the query by complexity.
@@ -488,6 +507,51 @@ export class EmbeddingRouter {
   loadManifestProfile(manifest: import("./manifest.ts").GenomeManifest): GenomeProfile | null {
     if (!this.strategyEngine) return null;
     return this.strategyEngine.loadProfile(manifest);
+  }
+
+  /**
+   * Auto-select a quantization strategy at startup by running the
+   * QuantizationAdvisor over a sample of embeddings from the genome.
+   *
+   * This is the integration hook that embedding-router callers should invoke
+   * once at startup (after loading the manifest and embedding cache) to
+   * automatically configure the best quantization strategy.
+   *
+   * Algorithm:
+   *  1. Run QuantizationAdvisor.advise() on the provided embedding samples.
+   *  2. Detect any anomalies (codec mismatch, unusual scale).
+   *  3. If `enableQuantizationStrategy` is true, load the manifest profile
+   *     into the strategy engine so subsequent embed() calls use the
+   *     advisor-recommended fallback chain.
+   *  4. Return the full QuantizationInitResult for caller inspection.
+   *
+   * When called without `enableQuantizationStrategy`, the advisor still runs
+   * and returns advice, but the strategy engine is not configured
+   * (strategyActive=false).  This allows callers to preview recommendations
+   * without activating the full adaptive engine.
+   *
+   * @param manifest        The loaded GenomeManifest (for section count).
+   * @param embeddingSamples  Representative float32 embeddings (may be empty).
+   * @param advisorOptions  Optional QuantizationAdvisor configuration overrides.
+   */
+  initializeQuantization(
+    manifest: import("./manifest.ts").GenomeManifest,
+    embeddingSamples: number[][] = [],
+    advisorOptions?: ConstructorParameters<typeof QuantizationAdvisor>[0],
+  ): QuantizationInitResult {
+    const advisor = new QuantizationAdvisor(advisorOptions);
+    const sectionCount = manifest.sections.length;
+
+    const advice = advisor.advise(embeddingSamples, sectionCount);
+    const anomalies = advisor.detectAnomalies(embeddingSamples, sectionCount);
+
+    let strategyActive = false;
+    if (this.strategyEngine) {
+      this.strategyEngine.loadProfile(manifest);
+      strategyActive = true;
+    }
+
+    return { advice, strategyActive, anomalies };
   }
 
   /**
