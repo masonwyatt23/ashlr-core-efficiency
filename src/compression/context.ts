@@ -16,6 +16,7 @@ import { estimateTokensFromMessages } from "../tokens/index.ts";
 import type { BudgetAllocation } from "../budget/multi-objective-learner.ts";
 import { trackCompressorOutcome, tierToRole } from "../session-log/cost-accounting.ts";
 import { defaultProviderRate } from "../tokens/index.ts";
+import { deduplicateMessageSequence, type DedupConfig, type DedupStats } from "./deduplication.ts";
 
 export interface ContextConfig {
   /** Max tokens before triggering compaction (default: 100000) */
@@ -62,16 +63,23 @@ export function applyAdaptiveBudget(
 /**
  * Tier 3: contextCollapse — remove redundant messages from older history.
  * - Remove short assistant messages (< 10 chars)
- * - Deduplicate consecutive tool results with similar content
+ * - Deduplicate consecutive tool results with similar content (hash-based)
+ * - Semantic deduplication pass via `deduplicateMessageSequence` (n-gram fingerprints)
  * - Keep last 5 messages at full fidelity
  *
  * Emits a `CompressorRoleRecord` when tokens are actually removed, so the
  * backpropagation engine can attribute LLM cost savings to this tier.
+ *
+ * @param messages    Message array to collapse.
+ * @param agent       Agent/session identifier for backprop attribution.
+ * @param provider    Provider name for cost rate lookup.
+ * @param dedupConfig Optional semantic dedup configuration overrides.
  */
 export function contextCollapse(
   messages: Message[],
   agent = "unknown",
   provider = "claude-3-5-sonnet",
+  dedupConfig?: DedupConfig,
 ): Message[] {
   if (messages.length <= 5) return messages;
 
@@ -104,7 +112,17 @@ export function contextCollapse(
     collapsed.push(msg);
   }
 
-  const result = [...collapsed, ...recent];
+  // Basic collapse result (hash-based dedup done above)
+  const basicResult = [...collapsed, ...recent];
+
+  // Semantic dedup pass — catches fuzzy duplicates missed by hash-based dedup
+  const { messages: result } = deduplicateMessageSequence(
+    basicResult,
+    { keepRecent, ...dedupConfig },
+    agent,
+    provider,
+  );
+
   const tokensAfter = estimateTokensFromMessages(result);
   const tokensSaved = tokensBefore - tokensAfter;
 
@@ -122,6 +140,9 @@ export function contextCollapse(
 
   return result;
 }
+
+/** Re-export DedupStats so callers can import it from the compression module. */
+export type { DedupConfig, DedupStats };
 
 /**
  * Check if context needs compaction.

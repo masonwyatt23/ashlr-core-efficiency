@@ -126,12 +126,14 @@ describe("tier ordering — monotonic savings", () => {
     expect(afterT2).toBeLessThan(original);
   });
 
-  test("T2 compresses more than T3 alone on large-tool-result-heavy input", () => {
-    // Input has 8 large tool results — snipCompact should outperform contextCollapse
+  test("T2 compresses the large unique tool results (snipCompact active)", () => {
+    // Input has 8 large unique tool results — snipCompact should reduce their size.
+    // Note: T3 (contextCollapse) now includes semantic dedup, which can remove entire
+    // duplicate large messages (3 identical dup_1 entries), so T3 may save more tokens
+    // than T2 on this fixture. The meaningful contract is that T2 reduces vs original.
     const msgs = buildRealisticConversation();
-    const { afterT3, afterT2 } = measureTiers(msgs);
-    // snipCompact targets the large tool results that contextCollapse ignores
-    expect(afterT2).toBeLessThan(afterT3);
+    const { original, afterT2 } = measureTiers(msgs);
+    expect(afterT2).toBeLessThan(original);
   });
 
   test("combined T2+T3 compresses at least as much as T2 alone", () => {
