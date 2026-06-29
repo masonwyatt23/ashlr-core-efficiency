@@ -23,6 +23,28 @@ import { RecalibrationEngine } from "./recalibration-engine.ts";
 
 // Re-export codec registry and recalibration engine for consumers.
 export { CodecRegistry } from "./provider-codec.ts";
+// Calibration report generator for CI/DevOps observability.
+export {
+  generateCalibrationReport,
+  persistCalibrationReport,
+  buildMarkdownSummary,
+  emitGitHubActionsSummary,
+  postSlackWebhook,
+  CONFIDENCE_HIGH_THRESHOLD,
+  CONFIDENCE_LOW_THRESHOLD,
+  DRIFT_WARN_THRESHOLD_PCT,
+  DRIFT_CRITICAL_THRESHOLD_PCT,
+  CALIBRATION_REPORT_FILENAME,
+  GENOME_EVOLUTION_DIR,
+} from "./calibration-report.ts";
+export type {
+  TokenCalibrationReport,
+  ProviderCalibrationEntry,
+  CalibrationSummary,
+  BinBreakdown,
+  ConfidenceLevel,
+  Days,
+} from "./calibration-report.ts";
 export type { ProviderTokenCodec, MessageBin } from "./provider-codec.ts";
 export { classifyMessage } from "./provider-codec.ts";
 export { RecalibrationEngine } from "./recalibration-engine.ts";
