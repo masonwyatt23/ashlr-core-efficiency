@@ -13,6 +13,7 @@
 
 import type { LLMSummarizer, Message } from "../types/index.ts";
 import { estimateTokensFromMessages } from "../tokens/index.ts";
+import type { BudgetAllocation } from "../budget/multi-objective-learner.ts";
 
 export interface ContextConfig {
   /** Max tokens before triggering compaction (default: 100000) */
@@ -28,6 +29,33 @@ export const DEFAULT_CONFIG: ContextConfig = {
   reserveTokens: 8192,
   recentMessageCount: 10,
 };
+
+/**
+ * Merge a `BudgetAllocation` from the multi-objective learner into a
+ * `ContextConfig` override.
+ *
+ * When a `BudgetAllocation` has been learned from real session data
+ * (estimatedCostUsd > 0) its `reserveTokensForResponse` replaces the
+ * default `reserveTokens`, giving the compressor an up-to-date budget
+ * boundary without requiring callers to manually thread allocation values
+ * through every compression call.
+ *
+ * When the allocation is the static fallback (estimatedCostUsd === 0) this
+ * function returns an empty object so the caller's existing config is
+ * unchanged — preserving backward compatibility.
+ *
+ * @param allocation  Learned or static-fallback budget allocation.
+ * @returns           Partial `ContextConfig` to spread into the caller's config.
+ */
+export function applyAdaptiveBudget(
+  allocation: BudgetAllocation,
+): Partial<ContextConfig> {
+  // Static-fallback sentinel: estimatedCostUsd === 0 means no real learning occurred.
+  if (allocation.estimatedCostUsd === 0) return {};
+  return {
+    reserveTokens: allocation.reserveTokensForResponse,
+  };
+}
 
 /**
  * Tier 3: contextCollapse — remove redundant messages from older history.

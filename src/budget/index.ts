@@ -12,7 +12,30 @@
  * `../compression/consolidation.ts` to emit a `CompressorRecommendation`
  * based on cross-session history. The recommendation is attached to the
  * returned `BudgetRebalanceResult` as `compressionRecommendation`.
+ *
+ * ### Multi-objective learner
+ *
+ * `BudgetMultiObjectiveLearner` and related types are re-exported from
+ * `./multi-objective-learner.ts` for convenience. The learner ingests
+ * historical session data and emits Pareto-optimal budget allocations
+ * balancing USD cost against end-user latency.
  */
+
+// Re-export the adaptive multi-objective learner and its public API.
+export type {
+  BudgetAllocation,
+  BudgetAllocationOptions,
+  BudgetCalibrationRecord,
+  BudgetDiagnostics,
+  MessageCountBucket,
+  ParetoPoint,
+  SessionSummary,
+} from "./multi-objective-learner.ts";
+export {
+  BudgetMultiObjectiveLearner,
+  bucketMessageCount,
+  computeParetoFrontier,
+} from "./multi-objective-learner.ts";
 
 /** System prompt gets this fraction of the provider's context limit. */
 export const SYSTEM_PROMPT_BUDGET_RATIO = 0.05;
@@ -464,8 +487,27 @@ export async function rebalanceBudgetOnSwitchWithConsolidation(
       newProvider,
       currentMessages.length,
     );
+
+    // Additionally consult the multi-objective learner for an adaptive allocation.
+    // This is best-effort: if no history exists the learner returns the static fallback
+    // which is identical to the pre-existing behavior.
+    const { BudgetMultiObjectiveLearner } = await import("./multi-objective-learner.ts");
+    const learner = new BudgetMultiObjectiveLearner(cwd);
+    const adaptiveAlloc = await learner.getRobustBudgetAllocation(
+      newProvider,
+      "",
+      { messageCount: currentMessages.length },
+    );
+
     return {
       ...base,
+      // Prefer the adaptive system budget when it was learned from real data
+      // (i.e. not the static fallback value). The static fallback has
+      // estimatedCostUsd === 0, so we use that as the sentinel.
+      newSystemBudget:
+        adaptiveAlloc.estimatedCostUsd > 0
+          ? adaptiveAlloc.systemPromptTokens
+          : base.newSystemBudget,
       compressionRecommendation: {
         recommendedTier: rec.recommendedTier,
         rationale: rec.rationale,
