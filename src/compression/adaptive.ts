@@ -30,6 +30,7 @@ import { recordCompressionCost } from "../session-log/cost-accounting.ts";
 import { computeProviderCostRatio } from "../budget/index.ts";
 import type { Message } from "../types/index.ts";
 import type { CompressibleProfile } from "./consolidation.ts";
+import { SemanticPreFilterer } from "./semantic-prefilter.ts";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -406,6 +407,9 @@ export async function calibrateCompressionThresholds(
  *                      observations). This allows cross-session compression
  *                      history to bootstrap tier selection on provider switch,
  *                      eliminating the per-project re-learn cost.
+ * @param skipPreFilter Optional flag to bypass the semantic pre-filter (e.g.
+ *                      in tests or when the caller has already applied its own
+ *                      keyword ranking). Defaults to false.
  */
 export function selectCompressionTierAdaptive(
   messages: Message[],
@@ -415,6 +419,7 @@ export function selectCompressionTierAdaptive(
   calibration?: CalibrationRecommendation | null,
   provider?: string | null,
   consolidationProfile?: CompressibleProfile | null,
+  skipPreFilter = false,
 ): CompressionTier {
   const cfg = { ...DEFAULT_CONFIG, ...config };
 
@@ -423,6 +428,38 @@ export function selectCompressionTierAdaptive(
 
   // No history → pure static (provider hint has no effect on static path)
   if (!history) return staticTier;
+
+  // ---------------------------------------------------------------------------
+  // Semantic pre-filter: TF-IDF + BM25 keyword ranking before Ollama calls.
+  //
+  // When history IS available (the learned path), we run the pre-filter to
+  // check whether keyword signal alone is decisive.  Two fast-exit paths:
+  //   • "pick_top" / "pick_cheaper" → return the keyword-chosen tier
+  //     immediately, skipping the full history + calibration walk below.
+  //   • "invoke_ollama" → fall through to the full history-based selection.
+  //
+  // The pre-filter is skipped when:
+  //   - skipPreFilter is explicitly true (testing / caller override)
+  //   - messages array is empty (no signal to extract)
+  // ---------------------------------------------------------------------------
+  if (!skipPreFilter && messages.length > 0) {
+    const limit = cfg.maxContextTokens - cfg.reserveTokens;
+    const prefilter = new SemanticPreFilterer();
+    const preResult = prefilter.rank(messages, limit);
+
+    if (preResult.recommendation !== "invoke_ollama") {
+      const keywordTier = prefilter.pickTier(preResult);
+      if (keywordTier !== null) {
+        // Validate the keyword-chosen tier still fits within budget (basic
+        // sanity check — the pre-filter is not budget-aware by design).
+        const tierTokens = estimatedTierTokens(messages, keywordTier as CompressionTier);
+        if (tierTokens + systemTokens <= limit) {
+          return keywordTier as CompressionTier;
+        }
+        // Budget check failed for keyword tier: fall through to full selection
+      }
+    }
+  }
 
   // Capture non-nullable reference so nested functions can reference it safely.
   const thresholds: LearnedThresholds = history;
