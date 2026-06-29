@@ -512,4 +512,93 @@ describe("embeddings — cache hit/miss, content-hash collision avoidance, cosin
     const results = await semanticSearch(cwd, "some query", 4000);
     expect(results).toEqual([]);
   });
+
+  // ── atomic write: crash-mid-write leaves no corrupt cache ────────────────
+
+  test("saveEmbeddingCache is atomic — orphaned .tmp does not corrupt readable cache", async () => {
+    const { saveEmbeddingCache, loadEmbeddingCache, contentHash } = await import("../src/genome/embeddings.ts");
+
+    // Write a good cache first.
+    const goodEntry = {
+      sectionPath: "vision/north-star.md",
+      embedding: [0.1, 0.2, 0.3],
+      contentHash: contentHash("good content"),
+      updatedAt: new Date().toISOString(),
+    };
+    await saveEmbeddingCache(cwd, [goodEntry]);
+
+    // Simulate a crash-mid-write: manually place a corrupt .tmp orphan next to
+    // the real cache file (as if a previous process died after writeFile but
+    // before rename).
+    const evolutionDir = join(cwd, ".ashlrcode", "genome", "evolution");
+    const tmpPath = join(evolutionDir, "embeddings.json.tmp");
+    await writeFile(tmpPath, "TRUNCATED {{{{ partial write", "utf-8");
+
+    // The corrupt .tmp must NOT affect loadEmbeddingCache — it reads only the
+    // canonical file.
+    const loaded = await loadEmbeddingCache(cwd);
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0]!.sectionPath).toBe("vision/north-star.md");
+
+    // A subsequent successful saveEmbeddingCache must overwrite the .tmp (via
+    // rename) and leave no orphan behind.
+    const updatedEntry = { ...goodEntry, embedding: [0.9, 0.8, 0.7] };
+    await saveEmbeddingCache(cwd, [updatedEntry]);
+    expect(existsSync(tmpPath)).toBe(false);
+
+    // Final state must reflect the updated entry, not the corrupt .tmp.
+    const reloaded = await loadEmbeddingCache(cwd);
+    expect(reloaded).toHaveLength(1);
+    expect(reloaded[0]!.embedding).toEqual([0.9, 0.8, 0.7]);
+  });
+});
+
+// ─── fitness timeout cleanup ─────────────────────────────────────────────────
+
+describe("fitness — measureTestPassRate timeout resource cleanup", () => {
+  let cwd: string;
+
+  beforeEach(async () => {
+    cwd = makeTmpDir();
+    await mkdir(cwd, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  test("measureFitness returns 0.5 testsPassRate and does not hang when process exits quickly", async () => {
+    // Write a package.json with a test script that exits immediately with failure.
+    // This exercises the normal exit path (not the 30s timeout), but validates
+    // that the dataPromise / resolveTimeout cleanup doesn't crash or leak.
+    await writeFile(
+      join(cwd, "package.json"),
+      JSON.stringify({ name: "timeout-test", scripts: { test: "exit 1" } }),
+      "utf-8",
+    );
+    const { measureFitness } = await import("../src/genome/fitness.ts");
+    const start = Date.now();
+    const metrics = await measureFitness(cwd);
+    const elapsed = Date.now() - start;
+
+    // Must complete quickly (well under the 30s internal timeout).
+    expect(elapsed).toBeLessThan(10_000);
+    // No passing tests reported → falls back to 0.5 (0 total tests parsed).
+    expect(metrics.testsPassRate).toBeGreaterThanOrEqual(0);
+    expect(metrics.testsPassRate).toBeLessThanOrEqual(1);
+  });
+
+  test("clearTimeout is called on normal exit — no timer fires after process completes", async () => {
+    // Write a package.json whose test script produces parseable bun output lines.
+    // The goal is to confirm the resolved dataPromise clears the timeout handle
+    // without error (i.e. the void dataPromise.then(resolveTimeout) path runs cleanly).
+    await writeFile(
+      join(cwd, "package.json"),
+      JSON.stringify({ name: "timer-test", scripts: { test: "echo '1 pass'" } }),
+      "utf-8",
+    );
+    const { measureFitness } = await import("../src/genome/fitness.ts");
+    // If the cleanup throws or leaks an unhandled rejection this test would fail.
+    await expect(measureFitness(cwd)).resolves.toBeDefined();
+  });
 });

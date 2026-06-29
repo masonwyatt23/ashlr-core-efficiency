@@ -11,7 +11,7 @@
 
 import { createHash } from "crypto";
 import { existsSync } from "fs";
-import { mkdir, readFile, writeFile } from "fs/promises";
+import { mkdir, readFile, rename, writeFile } from "fs/promises";
 import { dirname, join } from "path";
 import { estimateTokens, genomeDir, loadManifest, type SectionMeta } from "./manifest.ts";
 import type { RetrievedSection } from "./retriever.ts";
@@ -172,7 +172,16 @@ export async function saveEmbeddingCache(cwd: string, cache: EmbeddingCache[]): 
   if (!existsSync(dir)) {
     await mkdir(dir, { recursive: true });
   }
-  await writeFile(path, JSON.stringify(cache, null, 2), "utf-8");
+  // Atomic write: write to temp file then rename (safe on POSIX, mirrors saveManifest)
+  const tmp = path + ".tmp";
+  try {
+    await writeFile(tmp, JSON.stringify(cache, null, 2), "utf-8");
+    await rename(tmp, path);
+  } catch (e) {
+    const { unlink } = await import("fs/promises");
+    await unlink(tmp).catch(() => {});
+    throw e;
+  }
 }
 
 // ---------------------------------------------------------------------------

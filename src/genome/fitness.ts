@@ -95,15 +95,30 @@ async function measureTestPassRate(cwd: string): Promise<number> {
       env: { ...process.env, CI: "true" },
     });
 
-    // Race entire I/O + exit against timeout (prevents hang when stdout blocks)
-    const dataPromise = Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
-    const timeout = new Promise<never>((_, reject) =>
-      setTimeout(() => {
+    // Race entire I/O + exit against timeout (prevents hang when stdout blocks).
+    // On timeout we resolve dataPromise with empty output so its stream refs are
+    // released — leaving it unresolved would leak the stdout/stderr ReadableStream.
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    let resolveTimeout!: (v: [string, string, number]) => void;
+    const timeoutPromise = new Promise<[string, string, number]>((resolve) => {
+      resolveTimeout = resolve;
+      timeoutHandle = setTimeout(() => {
         proc.kill();
-        reject(new Error("Test timeout"));
-      }, 30_000),
-    );
-    const [stdout, stderr, exitCode] = await Promise.race([dataPromise, timeout]);
+        resolve(["", "", 1]);
+      }, 30_000);
+    });
+
+    const dataPromise = Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+
+    const [stdout, stderr, exitCode] = await Promise.race([dataPromise, timeoutPromise]);
+    clearTimeout(timeoutHandle);
+    // If dataPromise won, ensure timeoutPromise is also resolved (no-op since timer
+    // is cleared, but satisfies the resolver reference so GC can collect it).
+    void dataPromise.then(resolveTimeout).catch(() => {});
 
     // Parse test results from output
     const output = stdout + stderr;
