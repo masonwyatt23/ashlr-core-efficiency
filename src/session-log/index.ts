@@ -94,6 +94,29 @@ export type {
   RegretSignal,
 } from "./cost-accounting.ts";
 
+// Re-export streaming backpropagation engine.
+export {
+  BackpropagationEngine,
+  getBackpropEngine,
+  _resetBackpropEngine,
+  computeParetoFrontier,
+  getROIDashboard,
+  biasAdaptiveTierSelection,
+  attributeSessionCost,
+  persistBackpropRecord,
+  BACKPROP_WINDOW_SIZE,
+  BACKPROP_MIN_ROI_EFFICIENCY,
+  BACKPROP_MIN_SAMPLES,
+} from "./backpropagation.ts";
+
+export type {
+  BackpropAttributionRecord,
+  ProviderTierROI,
+  ParetoPoint,
+  ROIDashboard,
+  BiasedTierSelection,
+} from "./backpropagation.ts";
+
 // ---------- Configuration ------------------------------------------------
 
 /**
