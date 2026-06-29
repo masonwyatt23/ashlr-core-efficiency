@@ -309,6 +309,91 @@ export async function countTokensWithCache(
   };
 }
 
+// ---------- provider pricing constants ----------
+
+/**
+ * Known provider / model names for pricing lookups.
+ *
+ * The string union is open-ended so callers can pass any provider slug
+ * (e.g. `"claude-3-haiku-20240307"`) without a compile-time error; the
+ * pricing table falls back to a safe default for unknown strings.
+ */
+export type ProviderName =
+  | "claude-3-5-sonnet"
+  | "claude-3-5-haiku"
+  | "claude-3-opus"
+  | "claude-3-sonnet"
+  | "claude-3-haiku"
+  | "gpt-4o"
+  | "gpt-4o-mini"
+  | "gpt-4-turbo"
+  | "gemini-1-5-pro"
+  | "gemini-1-5-flash";
+
+/**
+ * Per-token USD rates for a provider.
+ *
+ * Rates are expressed as USD per **single token** (not per-million), so
+ * they are small numbers. Multiply by token count to get USD cost.
+ *
+ * Reference prices (per-million tokens, as of 2026):
+ *   claude-3-5-sonnet  $3.00 input / $15.00 output
+ *   claude-3-5-haiku   $0.80 input / $4.00  output
+ *   claude-3-opus      $15.00 input / $75.00 output
+ *   claude-3-sonnet    $3.00 input / $15.00 output
+ *   claude-3-haiku     $0.25 input / $1.25  output
+ *   gpt-4o             $5.00 input / $15.00 output
+ *   gpt-4o-mini        $0.15 input / $0.60  output
+ *   gpt-4-turbo        $10.00 input / $30.00 output
+ *   gemini-1-5-pro     $3.50 input / $10.50 output
+ *   gemini-1-5-flash   $0.075 input / $0.30 output
+ */
+export interface ProviderRate {
+  /** USD cost per input token. */
+  inputRate: number;
+  /** USD cost per output token. */
+  outputRate: number;
+}
+
+/** Pricing table indexed by `ProviderName`. */
+export const PROVIDER_RATES: Record<ProviderName, ProviderRate> = {
+  "claude-3-5-sonnet": { inputRate: 3.0 / 1_000_000, outputRate: 15.0 / 1_000_000 },
+  "claude-3-5-haiku":  { inputRate: 0.8 / 1_000_000, outputRate: 4.0  / 1_000_000 },
+  "claude-3-opus":     { inputRate: 15.0 / 1_000_000, outputRate: 75.0 / 1_000_000 },
+  "claude-3-sonnet":   { inputRate: 3.0 / 1_000_000, outputRate: 15.0 / 1_000_000 },
+  "claude-3-haiku":    { inputRate: 0.25 / 1_000_000, outputRate: 1.25 / 1_000_000 },
+  "gpt-4o":            { inputRate: 5.0 / 1_000_000, outputRate: 15.0 / 1_000_000 },
+  "gpt-4o-mini":       { inputRate: 0.15 / 1_000_000, outputRate: 0.60 / 1_000_000 },
+  "gpt-4-turbo":       { inputRate: 10.0 / 1_000_000, outputRate: 30.0 / 1_000_000 },
+  "gemini-1-5-pro":    { inputRate: 3.5 / 1_000_000, outputRate: 10.5 / 1_000_000 },
+  "gemini-1-5-flash":  { inputRate: 0.075 / 1_000_000, outputRate: 0.30 / 1_000_000 },
+};
+
+/**
+ * Default rate used when the provider string is not found in `PROVIDER_RATES`.
+ * Falls back to claude-3-5-sonnet pricing as a conservative mid-range estimate.
+ */
+export const DEFAULT_PROVIDER_RATE: ProviderRate = PROVIDER_RATES["claude-3-5-sonnet"];
+
+/**
+ * Look up the per-token rates for a provider string.
+ *
+ * Returns `DEFAULT_PROVIDER_RATE` for unknown providers so callers never
+ * get null/undefined — a wrong estimate is always better than a crash.
+ */
+export function defaultProviderRate(provider: string): ProviderRate {
+  if (provider in PROVIDER_RATES) {
+    return PROVIDER_RATES[provider as ProviderName];
+  }
+  // Try a prefix match for versioned slugs like "claude-3-5-sonnet-20241022"
+  for (const key of Object.keys(PROVIDER_RATES) as ProviderName[]) {
+    if (provider.startsWith(key)) {
+      return PROVIDER_RATES[key];
+    }
+  }
+  return DEFAULT_PROVIDER_RATE;
+}
+
 // ---------- actual-usage recording (adaptive compression hook) ----------
 
 /**

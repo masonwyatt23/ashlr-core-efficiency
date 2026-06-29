@@ -45,6 +45,22 @@ export type {
   TailOptions,
 } from "./types.ts";
 
+// Re-export cost accounting so callers can import everything from one place.
+export {
+  recordCompressionCost,
+  summarizeSessionROI,
+  getAmnesiaFlags,
+  hasAmnesiaFlags,
+  _getRecords,
+  _resetRecords,
+} from "./cost-accounting.ts";
+
+export type {
+  CompressionCostRecord,
+  TierROIBreakdown,
+  SessionROI,
+} from "./cost-accounting.ts";
+
 // ---------- Configuration ------------------------------------------------
 
 /**

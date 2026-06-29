@@ -26,6 +26,7 @@ import { join } from "path";
 import { appendJsonl, readJsonl } from "../genome/jsonl.ts";
 import { contextCollapse, selectCompressionTier, snipCompact, type CompressionTier, type ContextConfig, DEFAULT_CONFIG } from "./context.ts";
 import { estimateTokensFromMessages } from "../tokens/index.ts";
+import { recordCompressionCost } from "../session-log/cost-accounting.ts";
 import type { Message } from "../types/index.ts";
 
 // ---------------------------------------------------------------------------
@@ -161,11 +162,17 @@ export function compressionHistoryPath(cwd: string): string {
 /**
  * Append one compression outcome to the history file.
  *
- * @param cwd            Project working directory (genome root).
- * @param tier           Compression tier that was applied.
+ * Also feeds results into the cost-accounting layer so USD savings are
+ * tracked alongside the learning history. Pass `provider` and `timeMs`
+ * for full cost accounting; they default to sensible values if omitted.
+ *
+ * @param cwd             Project working directory (genome root).
+ * @param tier            Compression tier that was applied.
  * @param estimatedTokens Estimated token count before the LLM call.
- * @param actualTokens   Actual tokens reported by the LLM (from TokenUsage).
- * @param success        Whether the LLM call completed without a context error.
+ * @param actualTokens    Actual tokens reported by the LLM (from TokenUsage).
+ * @param success         Whether the LLM call completed without a context error.
+ * @param provider        Provider/model string for pricing lookup (default: "claude-3-5-sonnet").
+ * @param timeMs          Wall-clock time the compression took in ms (default: 0).
  */
 export async function recordCompressionResult(
   cwd: string,
@@ -173,6 +180,8 @@ export async function recordCompressionResult(
   estimatedTokens: number,
   actualTokens: number,
   success: boolean,
+  provider = "claude-3-5-sonnet",
+  timeMs = 0,
 ): Promise<void> {
   const record: CompressionFeedback = {
     tier,
@@ -182,6 +191,15 @@ export async function recordCompressionResult(
     recordedAt: new Date().toISOString(),
   };
   await appendJsonl(compressionHistoryPath(cwd), record);
+
+  // Feed into cost accounting. For tier 1, compute the signed estimation error.
+  const tokensRemoved = Math.max(0, estimatedTokens - actualTokens);
+  const estimationErrorPct =
+    tier === 1 && estimatedTokens > 0
+      ? ((actualTokens - estimatedTokens) / estimatedTokens) * 100
+      : 0;
+
+  recordCompressionCost(tier, tokensRemoved, timeMs, success, provider, estimationErrorPct);
 }
 
 // ---------------------------------------------------------------------------
