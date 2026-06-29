@@ -14,6 +14,8 @@
 import type { LLMSummarizer, Message } from "../types/index.ts";
 import { estimateTokensFromMessages } from "../tokens/index.ts";
 import type { BudgetAllocation } from "../budget/multi-objective-learner.ts";
+import { trackCompressorOutcome, tierToRole } from "../session-log/cost-accounting.ts";
+import { defaultProviderRate } from "../tokens/index.ts";
 
 export interface ContextConfig {
   /** Max tokens before triggering compaction (default: 100000) */
@@ -62,10 +64,18 @@ export function applyAdaptiveBudget(
  * - Remove short assistant messages (< 10 chars)
  * - Deduplicate consecutive tool results with similar content
  * - Keep last 5 messages at full fidelity
+ *
+ * Emits a `CompressorRoleRecord` when tokens are actually removed, so the
+ * backpropagation engine can attribute LLM cost savings to this tier.
  */
-export function contextCollapse(messages: Message[]): Message[] {
+export function contextCollapse(
+  messages: Message[],
+  agent = "unknown",
+  provider = "claude-3-5-sonnet",
+): Message[] {
   if (messages.length <= 5) return messages;
 
+  const tokensBefore = estimateTokensFromMessages(messages);
   const keepRecent = 5;
   const older = messages.slice(0, -keepRecent);
   const recent = messages.slice(-keepRecent);
@@ -94,7 +104,23 @@ export function contextCollapse(messages: Message[]): Message[] {
     collapsed.push(msg);
   }
 
-  return [...collapsed, ...recent];
+  const result = [...collapsed, ...recent];
+  const tokensAfter = estimateTokensFromMessages(result);
+  const tokensSaved = tokensBefore - tokensAfter;
+
+  if (tokensSaved > 0) {
+    const rate = defaultProviderRate(provider);
+    trackCompressorOutcome({
+      agent,
+      role: tierToRole(3),
+      triggeredAt: new Date().toISOString(),
+      tokensSaved,
+      costImpactUsd: tokensSaved * rate.inputRate,
+      queryLatencyMs: 0,
+    });
+  }
+
+  return result;
 }
 
 /**
@@ -118,11 +144,17 @@ export function needsCompaction(
  * Tier 1: autoCompact — summarize older messages.
  * Splits messages at the last N, summarizes everything before that window,
  * and prepends the summary as a synthetic user/assistant exchange.
+ *
+ * Emits a `CompressorRoleRecord` after the LLM summarization call completes
+ * so actual cost (including LLM overhead) is captured in the backpropagation
+ * path. `queryLatencyMs` reflects the real summarization round-trip time.
  */
 export async function autoCompact(
   messages: Message[],
   summarizer: LLMSummarizer,
   config: Partial<ContextConfig> = {},
+  agent = "unknown",
+  provider = "claude-3-5-sonnet",
 ): Promise<Message[]> {
   const cfg = { ...DEFAULT_CONFIG, ...config };
 
@@ -132,26 +164,60 @@ export async function autoCompact(
   const olderMessages = messages.slice(0, splitIndex);
   const recentMessages = messages.slice(splitIndex);
 
+  const tokensBefore = estimateTokensFromMessages(messages);
+  const t0 = Date.now();
   const summary = await summarizeMessages(olderMessages, summarizer);
+  const queryLatencyMs = Date.now() - t0;
 
-  return [
+  const result = [
     {
-      role: "user",
+      role: "user" as const,
       content: `[Context Summary — earlier conversation was compacted to save tokens]\n\n${summary}`,
     },
     {
-      role: "assistant",
+      role: "assistant" as const,
       content: "Understood. I have the context from our earlier conversation. Let me continue from where we left off.",
     },
     ...recentMessages,
   ];
+
+  // Emit backprop record after the LLM call completes (post-message) so
+  // actual latency and token savings are known.
+  const tokensAfter = estimateTokensFromMessages(result);
+  const tokensSaved = tokensBefore - tokensAfter;
+
+  if (tokensSaved > 0) {
+    const rate = defaultProviderRate(provider);
+    // Tier 1 cost: ongoing cache-read savings minus LLM overhead.
+    const llmOverhead = tokensBefore * rate.inputRate * 0.1 + 200 * rate.outputRate;
+    const costImpactUsd = tokensSaved * rate.inputRate * 0.1 - llmOverhead;
+    trackCompressorOutcome({
+      agent,
+      role: tierToRole(1),
+      triggeredAt: new Date().toISOString(),
+      tokensSaved,
+      costImpactUsd,
+      queryLatencyMs,
+    });
+  }
+
+  return result;
 }
 
 /**
  * Tier 2: snipCompact — remove verbose tool results and stale messages.
+ *
+ * Emits a `CompressorRoleRecord` when tool results are actually truncated,
+ * so the backpropagation engine can attribute LLM cost savings to this tier.
  */
-export function snipCompact(messages: Message[]): Message[] {
-  return messages.map((msg) => {
+export function snipCompact(
+  messages: Message[],
+  agent = "unknown",
+  provider = "claude-3-5-sonnet",
+): Message[] {
+  const tokensBefore = estimateTokensFromMessages(messages);
+
+  const result = messages.map((msg) => {
     if (typeof msg.content === "string") return msg;
 
     const trimmedBlocks = msg.content.map((block) => {
@@ -167,6 +233,23 @@ export function snipCompact(messages: Message[]): Message[] {
 
     return { ...msg, content: trimmedBlocks };
   });
+
+  const tokensAfter = estimateTokensFromMessages(result);
+  const tokensSaved = tokensBefore - tokensAfter;
+
+  if (tokensSaved > 0) {
+    const rate = defaultProviderRate(provider);
+    trackCompressorOutcome({
+      agent,
+      role: tierToRole(2),
+      triggeredAt: new Date().toISOString(),
+      tokensSaved,
+      costImpactUsd: tokensSaved * rate.inputRate,
+      queryLatencyMs: 0,
+    });
+  }
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +655,8 @@ export function treeCompact(
   messages: Message[],
   genomeGraph: unknown | undefined,
   config: TreeCompactConfig,
+  agent = "unknown",
+  provider = "claude-3-5-sonnet",
 ): TreeCompactionResult {
   const {
     tokenBudget,
@@ -691,16 +776,30 @@ export function treeCompact(
   // Build the compacted message array (preserve original order)
   const compacted = messages.filter((_, i) => !prunedIndices.has(i));
   const tokensAfter = estimateTokensFromMessages(compacted);
+  const tokensSaved = tokensBefore - tokensAfter;
 
   const report: TreeCompactionReport = {
     prunedIndices: [...prunedIndices].sort((a, b) => a - b),
     prunedSubtrees,
     tokensBefore,
     tokensAfter,
-    tokensSaved: tokensBefore - tokensAfter,
+    tokensSaved,
     targetAchieved: tokensAfter <= tokenBudget,
     messagesAfter: compacted.length,
   };
+
+  // Emit backprop record after pruning so actual savings are known.
+  if (tokensSaved > 0) {
+    const rate = defaultProviderRate(provider);
+    trackCompressorOutcome({
+      agent,
+      role: tierToRole(4),
+      triggeredAt: new Date().toISOString(),
+      tokensSaved,
+      costImpactUsd: tokensSaved * rate.inputRate,
+      queryLatencyMs: 0,
+    });
+  }
 
   return { messages: compacted, report };
 }

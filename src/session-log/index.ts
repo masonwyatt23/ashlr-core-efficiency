@@ -53,12 +53,25 @@ export {
   hasAmnesiaFlags,
   _getRecords,
   _resetRecords,
+  // Regret backpropagation engine
+  recordCompressorOutcome,
+  trackCompressorOutcome,
+  computeCompressorRegret,
+  buildBackpropagationPath,
+  tierToRole,
+  roleToTier,
+  _getOutcomeRecords,
+  _resetOutcomeRecords,
 } from "./cost-accounting.ts";
 
 export type {
   CompressionCostRecord,
   TierROIBreakdown,
   SessionROI,
+  // Regret backpropagation types
+  CompressorRoleRecord,
+  BackpropagationPath,
+  RegretSignal,
 } from "./cost-accounting.ts";
 
 // ---------- Configuration ------------------------------------------------

@@ -27,7 +27,23 @@
  * When tier 1 (autoCompact) produces a token estimation error beyond ±10%,
  * the entry is flagged for recalibration. Callers can query
  * `getAmnesiaFlags()` to find affected records and trigger re-tuning.
+ *
+ * ### Regret Backpropagation
+ *
+ * After an LLM call completes (post-message), the actual token cost is known.
+ * `computeCompressorRegret()` attributes the counterfactual cost delta to the
+ * specific compression tier that triggered compaction:
+ *   regret = cost_if_tier_not_fired − actual_cost_after_tier_fired
+ *
+ * `recordCompressorOutcome()` persists `CompressorRoleRecord` entries to
+ * `~/.ashlr/compressor-outcomes.jsonl` alongside the session log, enabling
+ * cross-session fleet-level "tier 2 saved $X this week" queries and automatic
+ * threshold tuning via the regret learner.
  */
+
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 
 import type { CompressionTier } from "../compression/context.ts";
 import { PROVIDER_RATES, type ProviderName, defaultProviderRate } from "../tokens/index.ts";
@@ -314,4 +330,319 @@ function buildCSV(records: readonly CompressionCostRecord[]): string {
     ].join(","),
   );
   return [header, ...rows].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Regret Backpropagation Engine
+// ---------------------------------------------------------------------------
+
+/**
+ * Role a compressor tier played in a specific query/session.
+ *
+ * Emitted by each tier function when it fires, then enriched with actual LLM
+ * cost after the post-message callback so `regret` can be computed precisely.
+ */
+export interface CompressorRoleRecord {
+  /** Agent or session identifier that triggered the compression. */
+  agent: string;
+  /** Which compression tier fired. */
+  role: "tier1_autoCompact" | "tier2_snipCompact" | "tier3_contextCollapse" | "tier4_treeCompact";
+  /** ISO-8601 wall-clock timestamp of when this tier triggered. */
+  triggeredAt: string;
+  /** Tokens removed (or estimated to be saved) by this tier invocation. */
+  tokensSaved: number;
+  /**
+   * Net USD impact of this tier firing.
+   * Positive = cost savings; negative = cost overhead (e.g. LLM summary call).
+   */
+  costImpactUsd: number;
+  /** Round-trip latency of the LLM call that followed this compression (ms). */
+  queryLatencyMs: number;
+}
+
+/**
+ * Causal chain from tool-result size → tier selection → LLM call → cost delta.
+ *
+ * Records the "before" and "after" state so the backpropagation engine can
+ * attribute responsibility to the specific tier that fired.
+ */
+export type BackpropagationPath = {
+  /** Tokens in context before any tier fired. */
+  tokensBefore: number;
+  /** Tokens in context after the tier fired (i.e. tokensBefore − tokensSaved). */
+  tokensAfter: number;
+  /** USD cost of the LLM call *with* the tier applied (actual observed cost). */
+  actualLlmCostUsd: number;
+  /**
+   * USD cost the LLM call *would have* cost without the tier
+   * (counterfactual — computed from tokensAfter + tokensSaved at input rate).
+   */
+  counterfactualLlmCostUsd: number;
+  /** Net cost delta: counterfactual − actual. Positive = the tier saved money. */
+  costDeltaUsd: number;
+  /** The tier whose firing is attributed with this cost delta. */
+  attributedTier: CompressionTier;
+  /** ISO-8601 timestamp of when the LLM call completed (post-message). */
+  attributedAt: string;
+};
+
+/**
+ * Output of `computeCompressorRegret` — quantifies "if this tier had NOT
+ * fired, what would the cost have been?"
+ *
+ * A positive `regretUsd` means the tier saved money (negative regret in the
+ * classical RL sense — this is actually *reward*). We keep the sign convention
+ * consistent with the rest of the regret-learner (lower is better).
+ */
+export interface RegretSignal {
+  /** The tier being evaluated. */
+  tier: CompressionTier;
+  /** Tokens removed by this tier in the evaluated window. */
+  tokensRemovedInWindow: number;
+  /** Actual USD cost incurred in the window. */
+  actualCostUsd: number;
+  /** Counterfactual USD cost if the tier had NOT fired in the window. */
+  counterfactualCostUsd: number;
+  /**
+   * USD saved by the tier: counterfactualCostUsd − actualCostUsd.
+   * Positive = tier saved money. Negative = tier cost more than it saved.
+   */
+  regretUsd: number;
+  /**
+   * Per-query average USD saving (regretUsd / queryCount).
+   * Useful for normalizing across sessions of different lengths.
+   */
+  avgSavingPerQuery: number;
+  /** Number of queries considered in this regret computation. */
+  queryCount: number;
+  /** ISO-8601 timestamp when this signal was computed. */
+  computedAt: string;
+}
+
+// ---------------------------------------------------------------------------
+// Compressor-outcome persistence
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolved path for compressor outcome records.
+ * Respects `ASHLR_COMPRESSOR_OUTCOMES_PATH`, else `~/.ashlr/compressor-outcomes.jsonl`.
+ * Evaluated lazily so tests can override via env before first call.
+ */
+function resolveOutcomesPath(): string {
+  const override = process.env.ASHLR_COMPRESSOR_OUTCOMES_PATH;
+  if (override && override.length > 0) return override;
+  return join(homedir(), ".ashlr", "compressor-outcomes.jsonl");
+}
+
+function ensureOutcomesDir(path: string): void {
+  const dir = dirname(path);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+}
+
+/**
+ * Append a `CompressorRoleRecord` to `~/.ashlr/compressor-outcomes.jsonl`.
+ *
+ * Write is best-effort: any I/O error is swallowed so a broken filesystem
+ * never crashes the compression pipeline. Uses POSIX O_APPEND for
+ * concurrent-writer safety (lines ≤ PIPE_BUF = 4KB on macOS/Linux).
+ *
+ * Set `ASHLR_COMPRESSOR_OUTCOMES_PATH` to override the file location (useful
+ * in tests). Set `ASHLR_SESSION_LOG=0` to disable all persistence writes.
+ *
+ * @param entry  The compressor outcome to persist.
+ */
+export function recordCompressorOutcome(entry: CompressorRoleRecord): void {
+  if (process.env.ASHLR_SESSION_LOG === "0") return;
+  try {
+    const path = resolveOutcomesPath();
+    ensureOutcomesDir(path);
+    const line = JSON.stringify(entry) + "\n";
+    appendFileSync(path, line, { flag: "a" });
+  } catch {
+    // Best-effort — never throw from a logging path.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// In-process compressor-outcome store (parallel to _records for session ROI)
+// ---------------------------------------------------------------------------
+
+const _outcomeRecords: CompressorRoleRecord[] = [];
+
+/** Expose outcome records for tests (read-only snapshot). */
+export function _getOutcomeRecords(): readonly CompressorRoleRecord[] {
+  return _outcomeRecords;
+}
+
+/** Reset outcome store — test hook only. */
+export function _resetOutcomeRecords(): void {
+  _outcomeRecords.length = 0;
+}
+
+/**
+ * Record a compressor outcome both in-process and on disk.
+ *
+ * This is the primary call site used by tier hooks in `context.ts`.
+ *
+ * @param entry  The compressor outcome to record.
+ */
+export function trackCompressorOutcome(entry: CompressorRoleRecord): void {
+  _outcomeRecords.push(entry);
+  recordCompressorOutcome(entry);
+}
+
+// ---------------------------------------------------------------------------
+// Regret computation
+// ---------------------------------------------------------------------------
+
+/**
+ * Map a `CompressionTier` number to its `CompressorRoleRecord.role` string.
+ */
+export function tierToRole(
+  tier: CompressionTier,
+): CompressorRoleRecord["role"] {
+  switch (tier) {
+    case 1: return "tier1_autoCompact";
+    case 2: return "tier2_snipCompact";
+    case 3: return "tier3_contextCollapse";
+    case 4: return "tier4_treeCompact";
+  }
+}
+
+/**
+ * Map a `CompressorRoleRecord.role` string back to its `CompressionTier` number.
+ */
+export function roleToTier(role: CompressorRoleRecord["role"]): CompressionTier {
+  switch (role) {
+    case "tier1_autoCompact": return 1;
+    case "tier2_snipCompact": return 2;
+    case "tier3_contextCollapse": return 3;
+    case "tier4_treeCompact": return 4;
+  }
+}
+
+/**
+ * Build a `BackpropagationPath` after an LLM call completes.
+ *
+ * Called post-message once the actual token usage is known. The path captures
+ * the causal chain from tier firing → token reduction → LLM cost delta.
+ *
+ * @param tokensBefore        Context tokens before the tier fired.
+ * @param tokensSaved         Tokens removed by the tier.
+ * @param actualLlmCostUsd    Observed USD cost of the LLM call after compression.
+ * @param tier                Tier attributed with this reduction.
+ * @param provider            Provider string for counterfactual pricing.
+ * @returns                   A fully-populated `BackpropagationPath`.
+ */
+export function buildBackpropagationPath(
+  tokensBefore: number,
+  tokensSaved: number,
+  actualLlmCostUsd: number,
+  tier: CompressionTier,
+  provider: string,
+): BackpropagationPath {
+  const rate = defaultProviderRate(provider);
+  // Counterfactual: what would the LLM call have cost without this tier?
+  // The tier removed `tokensSaved` tokens that would have been sent at
+  // the full input rate.
+  const counterfactualLlmCostUsd = actualLlmCostUsd + tokensSaved * rate.inputRate;
+  const costDeltaUsd = counterfactualLlmCostUsd - actualLlmCostUsd;
+
+  return {
+    tokensBefore,
+    tokensAfter: tokensBefore - tokensSaved,
+    actualLlmCostUsd,
+    counterfactualLlmCostUsd,
+    costDeltaUsd,
+    attributedTier: tier,
+    attributedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Quantify "if this tier had NOT fired, what would the cost have been?"
+ *
+ * Scans the `historyWindow` most-recent `CompressorRoleRecord` entries for
+ * the given `tier`, then computes the aggregate counterfactual vs actual cost
+ * from the `SessionROI` data.
+ *
+ * ### Algorithm
+ *
+ * For each matching outcome in the window:
+ *   counterfactual += tokensSaved × inputRate  (tokens that would have been sent)
+ *   actual         += |costImpactUsd|           (what we actually spent/saved)
+ *
+ * regretUsd = counterfactual − actual
+ *   Positive → tier saved money (good).
+ *   Negative → tier cost more than it saved (bad — recalibrate threshold).
+ *
+ * @param session        Current session ROI summary (for provider + cost data).
+ * @param tier           Compression tier to evaluate.
+ * @param historyWindow  Number of most-recent outcome records to consider.
+ * @returns              A `RegretSignal` quantifying the tier's cost impact.
+ */
+export function computeCompressorRegret(
+  session: SessionROI,
+  tier: CompressionTier,
+  historyWindow: number,
+): RegretSignal {
+  const role = tierToRole(tier);
+
+  // Pull the most-recent `historyWindow` outcomes for this tier.
+  const windowRecords = _outcomeRecords
+    .filter((r) => r.role === role)
+    .slice(-historyWindow);
+
+  const queryCount = windowRecords.length;
+
+  if (queryCount === 0) {
+    return {
+      tier,
+      tokensRemovedInWindow: 0,
+      actualCostUsd: 0,
+      counterfactualCostUsd: 0,
+      regretUsd: 0,
+      avgSavingPerQuery: 0,
+      queryCount: 0,
+      computedAt: new Date().toISOString(),
+    };
+  }
+
+  // Use the per-tier breakdown from SessionROI as the source of actual costs.
+  const breakdown = session.tierBreakdown[tier];
+  // Scale to the window fraction: window / total calls for this tier.
+  const totalCallsForTier = breakdown.callCount;
+  const windowFraction = totalCallsForTier > 0 ? Math.min(1, queryCount / totalCallsForTier) : 0;
+
+  // Actual cost impact (sum of |costImpactUsd| for window outcomes).
+  // costImpactUsd on a CompressorRoleRecord is the cost attributed at record time.
+  const actualCostUsd =
+    windowRecords.reduce((sum, r) => sum + Math.abs(r.costImpactUsd), 0);
+
+  // Counterfactual: tokens that would have been sent at full input rate.
+  // We reconstruct this from tokensSaved × default provider input rate.
+  // Use the provider from the first record in the window (best proxy).
+  const provider = windowRecords[0]!.agent; // agent field doubles as provider slug when set
+  const tokensRemovedInWindow = windowRecords.reduce((sum, r) => sum + r.tokensSaved, 0);
+
+  // If no provider info, use scaled SessionROI breakdown cost as counterfactual.
+  // This makes the function robust when agent field doesn't carry a provider slug.
+  const counterfactualCostUsd =
+    breakdown.costSaved > 0
+      ? breakdown.costSaved * windowFraction + actualCostUsd
+      : tokensRemovedInWindow * defaultProviderRate("claude-3-5-sonnet").inputRate;
+
+  const regretUsd = counterfactualCostUsd - actualCostUsd;
+  const avgSavingPerQuery = queryCount > 0 ? regretUsd / queryCount : 0;
+
+  return {
+    tier,
+    tokensRemovedInWindow,
+    actualCostUsd,
+    counterfactualCostUsd,
+    regretUsd,
+    avgSavingPerQuery,
+    queryCount,
+    computedAt: new Date().toISOString(),
+  };
 }
