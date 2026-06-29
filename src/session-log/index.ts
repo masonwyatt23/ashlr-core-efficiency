@@ -101,6 +101,7 @@ export {
   _resetBackpropEngine,
   computeParetoFrontier,
   getROIDashboard,
+  getLatencyDashboard,
   biasAdaptiveTierSelection,
   attributeSessionCost,
   persistBackpropRecord,
@@ -115,6 +116,8 @@ export type {
   ParetoPoint,
   ROIDashboard,
   BiasedTierSelection,
+  TierLatencySummary,
+  ModelLatencyDashboard,
 } from "./backpropagation.ts";
 
 // ---------- Configuration ------------------------------------------------

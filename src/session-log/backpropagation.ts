@@ -97,6 +97,17 @@ export interface BackpropAttributionRecord {
    * Used in the Pareto frontier (ROI vs latency trade-off).
    */
   latencyMs: number;
+  /**
+   * Wall-clock ms at which the LLM request was dispatched (Date.now() value).
+   * Optional — populated when the caller has request-start instrumentation.
+   */
+  requestStartMs?: number;
+  /**
+   * Wall-clock ms at which the first streamed token was received.
+   * Optional — populated when the caller streams responses and can observe
+   * time-to-first-token. Enables TTFT analysis separate from total latency.
+   */
+  firstTokenMs?: number;
 }
 
 /**
@@ -761,4 +772,129 @@ export async function attributeSessionCost(
   );
   persistBackpropRecord(rec);
   return rec;
+}
+
+// ---------------------------------------------------------------------------
+// Latency dashboard
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-tier latency summary for one model, returned by `getLatencyDashboard`.
+ */
+export interface TierLatencySummary {
+  /** Compression tier (1–4). */
+  tier: CompressionTier;
+  /** Number of records in the rolling window for this tier + model. */
+  sampleCount: number;
+  /** Mean LLM round-trip latency after this tier was applied (ms). */
+  avgLatencyMs: number;
+  /** Minimum observed latency (ms). */
+  minLatencyMs: number;
+  /** Maximum observed latency (ms). */
+  maxLatencyMs: number;
+  /** Mean time-to-first-token when requestStartMs + firstTokenMs are available (ms). */
+  avgTtftMs: number | null;
+  /** Mean USD cost per call. */
+  avgCostUsd: number;
+  /** Mean USD saved per call vs no compression. */
+  avgUsdSaved: number;
+}
+
+/**
+ * Latency dashboard for a single model — mirrors `ROIDashboard` but adds
+ * latency-specific statistics per tier.
+ */
+export interface ModelLatencyDashboard {
+  /** Model/provider slug. */
+  model: string;
+  /** Per-tier latency summaries (tiers with ≥ 1 record). */
+  tiers: TierLatencySummary[];
+  /** Tier with the lowest avgLatencyMs (among tiers with ≥ BACKPROP_MIN_SAMPLES records). */
+  fastestTier: CompressionTier | null;
+  /** Tier with the highest avgUsdSaved (among tiers with ≥ BACKPROP_MIN_SAMPLES records). */
+  cheapestTier: CompressionTier | null;
+  /** ISO-8601 timestamp. */
+  generatedAt: string;
+}
+
+/**
+ * Return a latency-focused dashboard for a specific model.
+ *
+ * Aggregates all BackpropAttributionRecord entries across tiers and buckets
+ * for the given model slug into per-tier latency + cost summaries. Mirrors
+ * `getROIDashboard` but surfaces latency as the primary metric instead of ROI.
+ *
+ * @param model   Model/provider slug (e.g. "claude-3-5-sonnet", "gpt-4o").
+ * @param engine  Optional engine instance. Defaults to module singleton.
+ * @returns       A `ModelLatencyDashboard` ready for rendering or export.
+ */
+export function getLatencyDashboard(
+  model: string,
+  engine?: BackpropagationEngine,
+): ModelLatencyDashboard {
+  const eng = engine ?? _engine;
+  const buckets = ["xs", "sm", "md", "lg"] as const;
+  const tiers: TierLatencySummary[] = [];
+
+  for (const tier of [1, 2, 3, 4] as CompressionTier[]) {
+    // Collect records across all buckets for this (tier, model) pair.
+    const allRecords: BackpropAttributionRecord[] = [];
+    for (const bucket of buckets) {
+      const recs = eng.getRecords(tier, model, bucket);
+      allRecords.push(...recs);
+    }
+    if (allRecords.length === 0) continue;
+
+    const latencies = allRecords.map((r) => r.latencyMs);
+    const avgLatencyMs = latencies.reduce((s, v) => s + v, 0) / latencies.length;
+    const minLatencyMs = Math.min(...latencies);
+    const maxLatencyMs = Math.max(...latencies);
+
+    // TTFT: only computable for records that carry both requestStartMs and firstTokenMs.
+    const ttftRecords = allRecords.filter(
+      (r) => r.requestStartMs !== undefined && r.firstTokenMs !== undefined,
+    );
+    const avgTtftMs =
+      ttftRecords.length > 0
+        ? ttftRecords.reduce((s, r) => s + (r.firstTokenMs! - r.requestStartMs!), 0) /
+          ttftRecords.length
+        : null;
+
+    const avgCostUsd =
+      allRecords.reduce((s, r) => s + r.actualCostUsd, 0) / allRecords.length;
+    const avgUsdSaved =
+      allRecords.reduce((s, r) => s + r.usdSaved, 0) / allRecords.length;
+
+    tiers.push({
+      tier,
+      sampleCount: allRecords.length,
+      avgLatencyMs,
+      minLatencyMs,
+      maxLatencyMs,
+      avgTtftMs,
+      avgCostUsd,
+      avgUsdSaved,
+    });
+  }
+
+  // Determine fastest + cheapest tiers (require BACKPROP_MIN_SAMPLES).
+  const eligible = tiers.filter((t) => t.sampleCount >= BACKPROP_MIN_SAMPLES);
+
+  const fastestTier =
+    eligible.length > 0
+      ? eligible.reduce((best, t) => (t.avgLatencyMs < best.avgLatencyMs ? t : best)).tier
+      : null;
+
+  const cheapestTier =
+    eligible.length > 0
+      ? eligible.reduce((best, t) => (t.avgUsdSaved > best.avgUsdSaved ? t : best)).tier
+      : null;
+
+  return {
+    model,
+    tiers,
+    fastestTier,
+    cheapestTier,
+    generatedAt: new Date().toISOString(),
+  };
 }

@@ -11,3 +11,4 @@ export * from "./priority.ts";
 export * from "./adaptive.ts";
 export * from "./deduplication.ts";
 export * from "./streaming-feedback.ts";
+export * from "./latency-roi-analyzer.ts";
