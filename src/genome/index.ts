@@ -19,6 +19,7 @@ export * from "./generations.ts";
 export * from "./init.ts";
 export * from "./jsonl.ts";
 export * from "./manifest.ts";
+export * from "./manifest-versioning.ts";
 export * from "./retriever.ts";
 export * from "./scribe.ts";
 export * from "./strategies.ts";

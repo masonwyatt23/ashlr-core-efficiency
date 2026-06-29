@@ -9,6 +9,7 @@ import { existsSync } from "fs";
 import { mkdir, readFile, rename, writeFile } from "fs/promises";
 import { dirname, join, sep } from "path";
 import { estimateTokensFromString as estimateTokens } from "../tokens/index.ts";
+import { CURRENT_SCHEMA_VERSION, upgradeManifestOnLoad } from "./manifest-versioning.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -57,6 +58,15 @@ export interface QuantizationStats {
 export interface GenomeManifest {
   /** Schema version for forward compat */
   version: 1;
+  /**
+   * Versioning-system schema version.  Added by the manifest-versioning layer;
+   * absent in legacy files (treated as 1 on load).
+   */
+  schemaVersion?: number;
+  /** ISO timestamp of last migration run (set by manifest-versioning layer). */
+  migratedAt?: string;
+  /** Human-readable migration audit trail (set by manifest-versioning layer). */
+  migrationAudit?: string[];
   /** Project name (informational) */
   project: string;
   /** All genome sections */
@@ -124,7 +134,21 @@ export async function loadManifest(cwd: string): Promise<GenomeManifest | null> 
 
   try {
     const raw = await readFile(path, "utf-8");
-    return JSON.parse(raw) as GenomeManifest;
+    const parsed = JSON.parse(raw) as GenomeManifest;
+
+    // Auto-upgrade if the stored schema version is behind the current version.
+    const storedVersion = typeof parsed.schemaVersion === "number" ? parsed.schemaVersion : 1;
+    if (storedVersion < CURRENT_SCHEMA_VERSION) {
+      const upgraded = await upgradeManifestOnLoad(cwd);
+      return upgraded ?? parsed;
+    }
+
+    // Backfill schemaVersion on legacy manifests that lack it
+    if (parsed.schemaVersion === undefined) {
+      parsed.schemaVersion = 1;
+    }
+
+    return parsed;
   } catch {
     // Corrupt or partially written manifest — treat as missing
     return null;
@@ -248,6 +272,7 @@ export function createEmptyManifest(project: string): GenomeManifest {
   const now = new Date().toISOString();
   return {
     version: 1,
+    schemaVersion: CURRENT_SCHEMA_VERSION,
     project,
     sections: [],
     generation: {
