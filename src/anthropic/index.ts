@@ -36,3 +36,26 @@ export {
   cacheBreakpoints,
   cacheMessagesBreakpoints,
 } from "./prompt-cache.ts";
+
+export {
+  CACHE_AUDIT_DIR,
+  CACHE_AUDIT_FILE,
+  type CacheStrategy,
+  type CacheAuditEntry,
+  type CacheAuditSummary,
+  cacheAuditPath,
+  computeEffectiveCostMicroUsd,
+  computeBaselineCostMicroUsd,
+  appendCacheAudit,
+  loadCacheAudit,
+  summarizeAuditWindow,
+} from "./cache-audit.ts";
+
+export {
+  CacheOptimizer,
+  resolveModelPricing,
+  type CacheOptimizerOptions,
+  type StrategyROI,
+  type ProviderSwitchRecommendation,
+  type CacheOptimizationReport,
+} from "./cache-optimizer.ts";
