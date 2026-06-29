@@ -31,6 +31,21 @@ export type {
   BinStats,
   ProviderCalibrationState,
 } from "./recalibration-engine.ts";
+// Unified calibration engine (consolidates RecalibrationEngine + CodecRegistry patterns).
+export { CalibrationEngine, tukeyBiweightMean } from "./calibration-engine.ts";
+export type {
+  CalibrationEngineRecord,
+  BinCalibration,
+  ProviderBinState,
+} from "./calibration-engine.ts";
+export {
+  MAX_RECORDS_PER_PROVIDER,
+  CE_MIN_SAMPLES,
+  CE_FACTOR_MIN,
+  CE_FACTOR_MAX,
+  CE_EMA_ALPHA,
+  TUKEY_C,
+} from "./calibration-engine.ts";
 
 // ---------- heuristic (back-compat, unchanged) ----------
 
