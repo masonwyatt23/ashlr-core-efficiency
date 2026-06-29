@@ -140,6 +140,46 @@ export function snipCompact(messages: Message[]): Message[] {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Tier selection
+// ---------------------------------------------------------------------------
+
+export type CompressionTier = 1 | 2 | 3;
+
+/**
+ * Select the cheapest compression tier that will bring token usage under budget.
+ *
+ * Tier 3 (contextCollapse) is tried first — lowest cost, no LLM call.
+ * Tier 2 (snipCompact) is tried next — truncates large tool results.
+ * Tier 1 (autoCompact) is the last resort — requires an LLM summarization call.
+ *
+ * Returns the tier number (1–3) that is predicted to fit within the budget,
+ * or 1 if no tier without LLM summarization is sufficient.
+ *
+ * @param messages       Current message array.
+ * @param systemTokens   Estimated tokens consumed by the system prompt.
+ * @param config         Context config (uses defaults if omitted).
+ */
+export function selectCompressionTier(
+  messages: Message[],
+  systemTokens: number,
+  config: Partial<ContextConfig> = {},
+): CompressionTier {
+  const cfg = { ...DEFAULT_CONFIG, ...config };
+  const budget = cfg.maxContextTokens - cfg.reserveTokens - systemTokens;
+
+  // Tier 3 — collapse short/dup messages
+  const collapsed = contextCollapse(messages);
+  if (estimateTokensFromMessages(collapsed) <= budget) return 3;
+
+  // Tier 2 — snip large tool results
+  const snipped = snipCompact(messages);
+  if (estimateTokensFromMessages(snipped) <= budget) return 2;
+
+  // Tier 1 — requires LLM summarization (caller must invoke autoCompact)
+  return 1;
+}
+
 /** Internal: ask the LLM to produce a compact summary of an older conversation slice. */
 async function summarizeMessages(messages: Message[], summarizer: LLMSummarizer): Promise<string> {
   const conversationText = messages
