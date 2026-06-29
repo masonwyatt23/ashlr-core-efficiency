@@ -8,3 +8,4 @@
 
 export * from "./context.ts";
 export * from "./priority.ts";
+export * from "./adaptive.ts";
