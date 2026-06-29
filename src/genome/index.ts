@@ -11,6 +11,7 @@
  */
 
 export * from "./embeddings.ts";
+export * from "./embedding-router.ts";
 export * from "./fitness.ts";
 export * from "./fitness-hooks.ts";
 export * from "./generations.ts";

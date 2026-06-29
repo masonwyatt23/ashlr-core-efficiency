@@ -14,6 +14,7 @@ import { join } from "path";
 import { appendJsonl, readJsonl } from "./jsonl.ts";
 import { genomeDir } from "./manifest.ts";
 import type { RetrievedSection } from "./retriever.ts";
+import type { EmbeddingModelName } from "./embedding-router.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -41,6 +42,11 @@ export interface RetrievalOutcomeRecord {
   query: string;
   queryType: QueryType;
   strategy: RetrievalStrategy;
+  /**
+   * The embedding model used when strategy === "semantic".
+   * Undefined for keyword retrievals or legacy records without model tracking.
+   */
+  modelName?: EmbeddingModelName;
   metrics: StrategyMetrics;
   timestamp: string;
 }
@@ -119,12 +125,15 @@ export function classifyQuery(query: string): QueryType {
  *
  * This is the primary learning signal: each call appends one line so the
  * adaptive selector can improve over time without any in-memory state.
+ *
+ * Pass `modelName` when `strategy === "semantic"` to enable per-model scoring.
  */
 export async function recordRetrievalOutcome(
   cwd: string,
   query: string,
   strategy: RetrievalStrategy,
   metrics: StrategyMetrics,
+  modelName?: EmbeddingModelName,
 ): Promise<string> {
   const id = `ro-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   const record: RetrievalOutcomeRecord = {
@@ -132,6 +141,7 @@ export async function recordRetrievalOutcome(
     query,
     queryType: classifyQuery(query),
     strategy,
+    ...(modelName !== undefined ? { modelName } : {}),
     metrics,
     timestamp: new Date().toISOString(),
   };
@@ -150,9 +160,32 @@ export async function loadRetrievalOutcomes(cwd: string): Promise<RetrievalOutco
 // Scoring model
 // ---------------------------------------------------------------------------
 
-/** Weighted score for a strategy from a slice of outcome records. */
-function scoreOutcomes(records: RetrievalOutcomeRecord[], strategy: RetrievalStrategy): number {
-  const relevant = records.filter((r) => r.strategy === strategy);
+/**
+ * Weighted score for a strategy from a slice of outcome records.
+ *
+ * When `modelName` is provided (semantic strategy), only records matching that
+ * model are considered — enabling per-(queryType, modelName) scoring.
+ * When `modelName` is omitted, all records for the strategy are scored
+ * together (backward-compatible behaviour).
+ */
+function scoreOutcomes(
+  records: RetrievalOutcomeRecord[],
+  strategy: RetrievalStrategy,
+  modelName?: EmbeddingModelName,
+): number {
+  let relevant = records.filter((r) => r.strategy === strategy);
+
+  // Narrow to model-specific records when a model is specified and the strategy
+  // is semantic. Records without modelName are included for backward compat.
+  if (strategy === "semantic" && modelName !== undefined) {
+    const modelSpecific = relevant.filter((r) => r.modelName === modelName);
+    // Only filter down if we have model-specific data; otherwise fall back to
+    // all semantic records so existing data still contributes.
+    if (modelSpecific.length > 0) {
+      relevant = modelSpecific;
+    }
+  }
+
   if (relevant.length === 0) return 0;
 
   let total = 0;
@@ -192,23 +225,36 @@ export interface AdaptiveRetrieverOptions {
    * Defaults to 4.
    */
   minOutcomesForLearning?: number;
+  /**
+   * When true, the AdaptiveRetriever uses the EmbeddingRouter to select the
+   * best embedding model per query complexity. When false (legacy), semantic
+   * search uses the default nomic-embed-text model.
+   * Defaults to true.
+   */
+  useModelRouter?: boolean;
 }
 
 /**
  * AdaptiveRetriever wraps both retrieval strategies and learns which to prefer
  * based on accumulated outcome metrics stored in JSONL.
+ *
+ * Model-awareness: when `useModelRouter` is true (default), semantic retrievals
+ * are routed through EmbeddingRouter, which selects the best embedding model per
+ * query complexity and tracks per-(queryType, modelName) outcome metrics.
  */
 export class AdaptiveRetriever {
   private readonly cwd: string;
   private readonly windowSize: number;
   private readonly latencyBudgetMs: number;
   private readonly minOutcomesForLearning: number;
+  private readonly useModelRouter: boolean;
 
   constructor(cwd: string, options: AdaptiveRetrieverOptions = {}) {
     this.cwd = cwd;
     this.windowSize = options.windowSize ?? 50;
     this.latencyBudgetMs = options.latencyBudgetMs ?? 3000;
     this.minOutcomesForLearning = options.minOutcomesForLearning ?? 4;
+    this.useModelRouter = options.useModelRouter ?? true;
   }
 
   /**
@@ -220,6 +266,8 @@ export class AdaptiveRetriever {
    *     heuristic: rare-term → keyword, semantic → semantic, general → keyword.
    *  3. Filter outcomes to the same query type, take the most recent `windowSize`.
    *  4. Score keyword vs semantic by average (matchQuality + budget_bonus - latency_penalty).
+   *     When model-routing is enabled, semantic scores are computed per model;
+   *     the best-model semantic score is used for the strategy comparison.
    *  5. If the winning strategy's average latency > `latencyBudgetMs`, prefer keyword.
    *  6. Return the winner.
    */
@@ -244,7 +292,14 @@ export class AdaptiveRetriever {
     }
 
     const keywordScore = scoreOutcomes(window, "keyword");
-    const semanticScore = scoreOutcomes(window, "semantic");
+
+    // For semantic, compute the best per-model score when model routing is on.
+    let semanticScore: number;
+    if (this.useModelRouter) {
+      semanticScore = this._bestSemanticModelScore(window);
+    } else {
+      semanticScore = scoreOutcomes(window, "semantic");
+    }
 
     // Determine the preferred winner.
     let preferred: RetrievalStrategy = semanticScore > keywordScore ? "semantic" : "keyword";
@@ -266,24 +321,41 @@ export class AdaptiveRetriever {
    * Runs the selected strategy, records timing, and returns both the results
    * and the strategy used. Callers should later call `recordRetrievalOutcome`
    * with their quality assessment.
+   *
+   * When model routing is enabled and the semantic strategy is chosen, the
+   * embedding model is selected automatically by EmbeddingRouter and the
+   * returned `modelName` indicates which model was used.
    */
   async retrieve(
     query: string,
     maxTokens: number,
-  ): Promise<{ results: RetrievedSection[]; strategy: RetrievalStrategy; latencyMs: number }> {
+  ): Promise<{
+    results: RetrievedSection[];
+    strategy: RetrievalStrategy;
+    latencyMs: number;
+    modelName?: EmbeddingModelName;
+  }> {
     const strategy = await this.selectBestStrategy(query);
     const start = Date.now();
 
     let results: RetrievedSection[] = [];
 
     if (strategy === "semantic") {
-      results = await this._runSemantic(query, maxTokens);
+      const semanticResult = await this._runSemantic(query, maxTokens);
+      results = semanticResult.results;
       // If semantic returned nothing (Ollama unavailable), fall back to keyword.
       if (results.length === 0) {
         results = await this._runKeyword(query, maxTokens);
         const latencyMs = Date.now() - start;
         return { results, strategy: "keyword", latencyMs };
       }
+      const latencyMs = Date.now() - start;
+      return {
+        results,
+        strategy,
+        latencyMs,
+        modelName: semanticResult.modelName,
+      };
     } else {
       results = await this._runKeyword(query, maxTokens);
     }
@@ -309,18 +381,61 @@ export class AdaptiveRetriever {
     return relevant.reduce((sum, r) => sum + r.metrics.latencyMs, 0) / relevant.length;
   }
 
+  /**
+   * Compute the best semantic score across all known embedding models.
+   * Returns the highest per-model score, enabling fair comparison with keyword.
+   */
+  private _bestSemanticModelScore(records: RetrievalOutcomeRecord[]): number {
+    const { EMBEDDING_MODELS } = require("./embedding-router.ts");
+    const modelNames = Object.keys(EMBEDDING_MODELS) as EmbeddingModelName[];
+    let best = scoreOutcomes(records, "semantic"); // fallback: unfiltered
+    for (const modelName of modelNames) {
+      const s = scoreOutcomes(records, "semantic", modelName);
+      if (s > best) best = s;
+    }
+    return best;
+  }
+
   private async _runKeyword(query: string, maxTokens: number): Promise<RetrievedSection[]> {
     const { retrieveSections } = await import("./retriever.ts");
     return retrieveSections(this.cwd, query, maxTokens);
   }
 
-  private async _runSemantic(query: string, maxTokens: number): Promise<RetrievedSection[]> {
+  private async _runSemantic(
+    query: string,
+    maxTokens: number,
+  ): Promise<{ results: RetrievedSection[]; modelName?: EmbeddingModelName }> {
     try {
       const { isOllamaAvailable, semanticSearch } = await import("./embeddings.ts");
-      if (!(await isOllamaAvailable())) return [];
-      return semanticSearch(this.cwd, query, maxTokens);
+      if (!(await isOllamaAvailable())) return { results: [] };
+
+      if (this.useModelRouter) {
+        // Route through EmbeddingRouter to select the best model per query complexity
+        const { EmbeddingRouter } = await import("./embedding-router.ts");
+        const router = new EmbeddingRouter(this.cwd, {
+          windowSize: this.windowSize,
+          latencyBudgetMs: this.latencyBudgetMs,
+          minOutcomesForLearning: this.minOutcomesForLearning,
+        });
+        const { classifyQueryComplexity, selectEmbeddingModel, loadModelOutcomes } =
+          await import("./embedding-router.ts");
+        const complexity = classifyQueryComplexity(query);
+        const outcomes = await loadModelOutcomes(this.cwd);
+        const modelName = selectEmbeddingModel(complexity, outcomes, {
+          windowSize: this.windowSize,
+          latencyBudgetMs: this.latencyBudgetMs,
+          minOutcomesForLearning: this.minOutcomesForLearning,
+        });
+        void router; // router used for side-effect: outcome tracking done by caller
+        const results = await semanticSearch(this.cwd, query, maxTokens, modelName);
+        return { results, modelName };
+      }
+
+      // Legacy path: use default model
+      const results = await semanticSearch(this.cwd, query, maxTokens);
+      return { results };
     } catch {
-      return [];
+      return { results: [] };
     }
   }
 }

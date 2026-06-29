@@ -36,13 +36,27 @@ export interface EmbeddingCache {
 // ---------------------------------------------------------------------------
 
 const OLLAMA_BASE_URL = "http://localhost:11434";
-const DEFAULT_EMBEDDING_MODEL = "nomic-embed-text";
+export const DEFAULT_EMBEDDING_MODEL = "nomic-embed-text";
 const CACHE_FILE = "evolution/embeddings.json";
 
 /** Timeout for Ollama connectivity check (ms) */
 const AVAILABILITY_TIMEOUT_MS = 2000;
 /** Timeout for individual embedding generation (ms) */
 const EMBEDDING_TIMEOUT_MS = 15000;
+
+/**
+ * All supported embedding models with their quality/latency tier.
+ *
+ * Re-exported here for consumers that only import from embeddings.ts
+ * and do not need the full EmbeddingRouter orchestration.
+ */
+export const SUPPORTED_EMBEDDING_MODELS = [
+  "nomic-embed-text",
+  "all-minilm-l6-v2",
+  "bge-base-en-v1-5",
+] as const;
+
+export type SupportedEmbeddingModel = (typeof SUPPORTED_EMBEDDING_MODELS)[number];
 
 // ---------------------------------------------------------------------------
 // Ollama connectivity
