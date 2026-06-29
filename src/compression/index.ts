@@ -10,3 +10,4 @@ export * from "./context.ts";
 export * from "./priority.ts";
 export * from "./adaptive.ts";
 export * from "./deduplication.ts";
+export * from "./streaming-feedback.ts";
