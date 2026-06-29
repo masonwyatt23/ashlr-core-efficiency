@@ -301,7 +301,7 @@ export class ProviderCostOracle {
     if (this.ema[lower] !== undefined) return lower;
     // Substring match.
     for (const key of Object.keys(this.ema)) {
-      if (lower.includes(key) || key.includes(lower)) return key;
+      if (lower.includes(key)) return key;
     }
     return null;
   }
