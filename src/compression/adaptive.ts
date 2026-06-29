@@ -27,6 +27,7 @@ import { appendJsonl, readJsonl } from "../genome/jsonl.ts";
 import { contextCollapse, selectCompressionTier, snipCompact, type CompressionTier, type ContextConfig, DEFAULT_CONFIG } from "./context.ts";
 import { estimateTokensFromMessages } from "../tokens/index.ts";
 import { recordCompressionCost } from "../session-log/cost-accounting.ts";
+import { computeProviderCostRatio } from "../budget/index.ts";
 import type { Message } from "../types/index.ts";
 
 // ---------------------------------------------------------------------------
@@ -387,6 +388,13 @@ export async function calibrateCompressionThresholds(
  *                      drift is detected for a tier, the window weight
  *                      adjustment supersedes the history overshoot factor for
  *                      that tier, producing tighter budget predictions.
+ * @param provider      Optional current provider name. When supplied the
+ *                      function consults `computeProviderCostRatio` relative to
+ *                      a neutral baseline ("anthropic") and applies the
+ *                      recommended tier shift so cheaper providers naturally
+ *                      use lighter compression and more expensive providers use
+ *                      more aggressive compression. Has no effect when
+ *                      `history` is `null` (static path remains unchanged).
  */
 export function selectCompressionTierAdaptive(
   messages: Message[],
@@ -394,13 +402,14 @@ export function selectCompressionTierAdaptive(
   config: Partial<ContextConfig> = {},
   history?: LearnedThresholds | null,
   calibration?: CalibrationRecommendation | null,
+  provider?: string | null,
 ): CompressionTier {
   const cfg = { ...DEFAULT_CONFIG, ...config };
 
   // Always compute static baseline first
   const staticTier = selectCompressionTier(messages, systemTokens, cfg);
 
-  // No history → pure static
+  // No history → pure static (provider hint has no effect on static path)
   if (!history) return staticTier;
 
   // Capture non-nullable reference so nested functions can reference it safely.
@@ -455,14 +464,30 @@ export function selectCompressionTierAdaptive(
 
   // Walk from cheapest (3) to most aggressive (1), picking the first tier
   // that is predicted to succeed according to history.
+  let selectedTier: CompressionTier = 1; // default: most aggressive fallback
   for (const tier of [3, 2, 1] as CompressionTier[]) {
     if (tierLikelySucceeds(tier)) {
-      return tier;
+      selectedTier = tier;
+      break;
     }
   }
 
-  // All learned tiers are predicted to fail — fall back to the most aggressive.
-  return 1;
+  // Apply provider-pricing tier shift when a provider hint is supplied.
+  // We compare against "anthropic" as the neutral baseline (mid-range pricing).
+  // A cheaper provider (e.g. deepseek, groq) relaxes compression by one tier;
+  // a more expensive provider (e.g. o1, xai) tightens it by one tier.
+  if (provider) {
+    const { recommendedTierShift } = computeProviderCostRatio("anthropic", provider);
+    if (recommendedTierShift !== 0) {
+      // Tier numbers are inverted: lower number = more aggressive.
+      // A shift of -1 (cheaper provider) means less aggressive → higher tier number.
+      // A shift of +1 (pricier provider) means more aggressive → lower tier number.
+      const shifted = (selectedTier - recommendedTierShift) as CompressionTier;
+      selectedTier = Math.min(3, Math.max(1, shifted)) as CompressionTier;
+    }
+  }
+
+  return selectedTier;
 }
 
 // ---------------------------------------------------------------------------

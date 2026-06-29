@@ -207,3 +207,197 @@ export function systemPromptBudget(
   const limit = getProviderContextLimit(providerName);
   return Math.min(Math.floor(limit * ratio), cap);
 }
+
+// ---------------------------------------------------------------------------
+// Provider pricing registry
+// ---------------------------------------------------------------------------
+
+/**
+ * Canonical per-token pricing for each provider (USD per million tokens).
+ * Input/output prices reflect the most common non-reasoning model in the family.
+ * Cache read prices use Anthropic's 0.1× rule where applicable; OpenAI uses 0.5×.
+ * Providers without published pricing use conservative estimates based on
+ * comparable model families.
+ */
+export const PROVIDER_PRICING: Record<
+  string,
+  { inputPerMToken: number; outputPerMToken: number; cacheReadPerMToken: number }
+> = {
+  anthropic:  { inputPerMToken: 3.0,   outputPerMToken: 15.0,  cacheReadPerMToken: 0.30  },
+  openai:     { inputPerMToken: 2.5,   outputPerMToken: 10.0,  cacheReadPerMToken: 1.25  },
+  xai:        { inputPerMToken: 5.0,   outputPerMToken: 15.0,  cacheReadPerMToken: 0.25  },
+  groq:       { inputPerMToken: 0.27,  outputPerMToken: 0.27,  cacheReadPerMToken: 0.027 },
+  deepseek:   { inputPerMToken: 0.14,  outputPerMToken: 0.28,  cacheReadPerMToken: 0.014 },
+  ollama:     { inputPerMToken: 0.0,   outputPerMToken: 0.0,   cacheReadPerMToken: 0.0   },
+};
+
+// ---------------------------------------------------------------------------
+// Provider cost-ratio computation
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of comparing per-token costs between two providers.
+ *
+ * Ratios < 1.0 mean the target provider is cheaper than the source on that
+ * dimension. For example, `inputRatio: 0.83` when switching anthropic → openai
+ * means OpenAI charges 83% of what Anthropic charges for input tokens.
+ */
+export interface ProviderCostRatio {
+  /** inputPerMToken(to) / inputPerMToken(from). Clamped to [0, 10]. */
+  inputRatio: number;
+  /** outputPerMToken(to) / outputPerMToken(from). Clamped to [0, 10]. */
+  outputRatio: number;
+  /** cacheReadPerMToken(to) / cacheReadPerMToken(from). Clamped to [0, 10]. */
+  cacheReadRatio: number;
+  /**
+   * Recommended tier shift as a signed integer.
+   *
+   *  0 — no change recommended.
+   * +1 — move one tier more aggressive (e.g. tier 2 → tier 1: LLM summarisation).
+   * -1 — move one tier less aggressive (e.g. tier 2 → tier 3: cheaper snipping
+   *       is now sufficient because the target provider is significantly cheaper).
+   *
+   * The recommendation is based on the blended cost ratio:
+   *   blended = (inputRatio + outputRatio) / 2
+   *   blended < 0.5  → cheaper provider: relax by one tier (-1)
+   *   blended > 2.0  → more expensive:   tighten by one tier (+1)
+   *   otherwise      → no change (0)
+   */
+  recommendedTierShift: -1 | 0 | 1;
+}
+
+/**
+ * Compute the relative per-token cost ratios when switching from one provider
+ * to another.
+ *
+ * Falls back to the DEFAULT_CONTEXT_LIMIT provider's pricing (treated as
+ * unknown = mid-range) when either provider is not in `PROVIDER_PRICING`.
+ *
+ * @param from  Source provider name (case-insensitive substring match).
+ * @param to    Target provider name (case-insensitive substring match).
+ * @returns     `ProviderCostRatio` with ratio values and tier recommendation.
+ */
+export function computeProviderCostRatio(from: string, to: string): ProviderCostRatio {
+  const unknownPricing = { inputPerMToken: 3.0, outputPerMToken: 15.0, cacheReadPerMToken: 0.3 };
+
+  function resolvePricing(name: string) {
+    const lower = name.toLowerCase();
+    for (const [key, pricing] of Object.entries(PROVIDER_PRICING)) {
+      if (lower.includes(key)) return pricing;
+    }
+    return unknownPricing;
+  }
+
+  const fromP = resolvePricing(from);
+  const toP   = resolvePricing(to);
+
+  // Guard against divide-by-zero for zero-cost providers (e.g. ollama → anthropic).
+  function safeRatio(numerator: number, denominator: number): number {
+    if (denominator === 0) return numerator === 0 ? 1.0 : 10.0;
+    return Math.min(10.0, Math.max(0, numerator / denominator));
+  }
+
+  const inputRatio     = safeRatio(toP.inputPerMToken,     fromP.inputPerMToken);
+  const outputRatio    = safeRatio(toP.outputPerMToken,    fromP.outputPerMToken);
+  const cacheReadRatio = safeRatio(toP.cacheReadPerMToken, fromP.cacheReadPerMToken);
+
+  const blended = (inputRatio + outputRatio) / 2;
+  let recommendedTierShift: -1 | 0 | 1 = 0;
+  if (blended < 0.5)  recommendedTierShift = -1; // much cheaper → relax compression
+  if (blended > 2.0)  recommendedTierShift = +1; // much pricier  → tighten compression
+
+  return { inputRatio, outputRatio, cacheReadRatio, recommendedTierShift };
+}
+
+// ---------------------------------------------------------------------------
+// Budget rebalancing on provider switch
+// ---------------------------------------------------------------------------
+
+/**
+ * Result returned by `rebalanceBudgetOnSwitch`.
+ */
+export interface BudgetRebalanceResult {
+  /**
+   * New system-prompt token budget computed for the target provider.
+   * Capped at `SYSTEM_PROMPT_BUDGET_CAP` (50K).
+   */
+  newSystemBudget: number;
+  /**
+   * Recommended compression tier for the target provider (1–3).
+   *
+   * Derived by applying `recommendedTierShift` from `computeProviderCostRatio`
+   * to a baseline tier inferred from the current message token count.
+   */
+  recommendedTier: 1 | 2 | 3;
+  /**
+   * Delta between the old system-prompt budget and the new one.
+   * Positive means the new budget is larger (target has more context headroom).
+   * Negative means it shrank.
+   */
+  tokensFreed: number;
+}
+
+/**
+ * Rebalance compression tier thresholds and system-prompt budget when
+ * switching the active LLM provider mid-session.
+ *
+ * Steps:
+ *  1. Recompute system-prompt budget using the new provider's context limit.
+ *  2. Estimate message token usage from `currentMessages`.
+ *  3. Derive a baseline tier from how full the new provider's context window is.
+ *  4. Apply the cost-ratio tier shift: cheaper provider → relax one tier,
+ *     more expensive → tighten one tier.
+ *
+ * @param oldProvider      The provider being switched away from.
+ * @param newProvider      The provider being switched to.
+ * @param currentMessages  Messages currently in the context window.
+ * @returns                New budget, recommended tier, and token delta.
+ */
+export function rebalanceBudgetOnSwitch(
+  oldProvider: string,
+  newProvider: string,
+  currentMessages: { role: string; content: string | unknown[] }[],
+): BudgetRebalanceResult {
+  const oldBudget = systemPromptBudget(oldProvider);
+  const newBudget = systemPromptBudget(newProvider);
+
+  // Estimate message tokens via the chars/4 heuristic used elsewhere in the lib.
+  let messageTokens = 0;
+  for (const m of currentMessages) {
+    if (typeof m.content === "string") {
+      messageTokens += Math.ceil(m.content.length / 4);
+    } else if (Array.isArray(m.content)) {
+      for (const block of m.content) {
+        if (block && typeof block === "object") {
+          const b = block as Record<string, unknown>;
+          if (typeof b["text"] === "string")    messageTokens += Math.ceil(b["text"].length / 4);
+          if (typeof b["thinking"] === "string") messageTokens += Math.ceil(b["thinking"].length / 4);
+          if (typeof b["content"] === "string") messageTokens += Math.ceil(b["content"].length / 4);
+        }
+      }
+    }
+  }
+
+  const newContextLimit = getProviderContextLimit(newProvider);
+  const reserveTokens   = 8192;
+  const available       = newContextLimit - reserveTokens - newBudget;
+  const fillRatio       = available > 0 ? messageTokens / available : 1.0;
+
+  // Baseline tier from fill ratio:
+  //   < 50% full → tier 3 (cheapest, light snipping)
+  //   50–80% full → tier 2 (moderate snip-compact)
+  //   > 80% full → tier 1 (full LLM summarisation)
+  let baselineTier: 1 | 2 | 3 = 3;
+  if (fillRatio >= 0.8) baselineTier = 1;
+  else if (fillRatio >= 0.5) baselineTier = 2;
+
+  // Apply cost-ratio tier shift (clamp to valid range 1–3).
+  const { recommendedTierShift } = computeProviderCostRatio(oldProvider, newProvider);
+  const shiftedTier = Math.min(3, Math.max(1, baselineTier - recommendedTierShift)) as 1 | 2 | 3;
+
+  return {
+    newSystemBudget: newBudget,
+    recommendedTier: shiftedTier,
+    tokensFreed: newBudget - oldBudget,
+  };
+}
