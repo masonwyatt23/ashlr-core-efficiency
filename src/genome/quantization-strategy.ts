@@ -21,6 +21,7 @@
 import { appendJsonl, readJsonl } from "./jsonl.ts";
 import { genomeDir, type GenomeManifest, type SectionMeta } from "./manifest.ts";
 import { join } from "path";
+import { homedir } from "os";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -719,6 +720,368 @@ function _buildRationale(s: StrategyStats): string {
 }
 
 // ---------------------------------------------------------------------------
+// Fallback Chain Types
+// ---------------------------------------------------------------------------
+
+/**
+ * Model tier labels matching those in embedding-router.ts but defined
+ * locally to avoid a circular dependency.
+ */
+export type QuantizationModelTier = "accurate" | "balanced" | "fast" | "ultrafast";
+
+/**
+ * A single step in a QuantizationFallbackChain.
+ * Each step specifies a (bitDepth, modelTier, timeoutMs) tuple.
+ */
+export interface FallbackChainStep {
+  bitDepth: QuantizationBitDepth;
+  modelTier: QuantizationModelTier;
+  /** Hard timeout for this step in ms. If a step exceeds this, the next step is tried. */
+  timeoutMs: number;
+}
+
+/**
+ * An ordered list of fallback steps for quantization selection.
+ * Steps are tried from index 0 (preferred, highest quality) to the last
+ * (most degraded, guaranteed-fast).
+ *
+ * Canonical default:
+ *   [(16, 'accurate', 5000), (16, 'balanced', 10000), (8, 'fast', 3000), (4, 'ultrafast', 1000)]
+ */
+export type QuantizationFallbackChain = FallbackChainStep[];
+
+/** Default fallback chain: quality-first with progressive degradation. */
+export const DEFAULT_FALLBACK_CHAIN: QuantizationFallbackChain = [
+  { bitDepth: 16, modelTier: "accurate",   timeoutMs: 5_000 },
+  { bitDepth: 16, modelTier: "balanced",   timeoutMs: 10_000 },
+  { bitDepth: 8,  modelTier: "fast",       timeoutMs: 3_000 },
+  { bitDepth: 4,  modelTier: "ultrafast",  timeoutMs: 1_000 },
+];
+
+/** The result of a successful quantization selection via fallback chain. */
+export interface SelectedQuantization {
+  bitDepth: QuantizationBitDepth;
+  modelTier: QuantizationModelTier;
+  /** Index of the chain step that succeeded (0 = preferred). */
+  stepIndex: number;
+  /** Whether this selection degraded from the preferred step (stepIndex > 0). */
+  usedFallback: boolean;
+  /** Execution metadata from the chain traversal. */
+  fallbackMeta: FallbackExecutionMetadata;
+}
+
+/**
+ * Per-step execution record emitted during chain traversal.
+ * Tracks outcome for each attempted step.
+ */
+export interface FallbackStepRecord {
+  stepIndex: number;
+  bitDepth: QuantizationBitDepth;
+  modelTier: QuantizationModelTier;
+  timeoutMs: number;
+  latencyMs: number;
+  /** "success" | "timeout" | "error" */
+  outcome: "success" | "timeout" | "error";
+  errorMessage?: string;
+}
+
+/**
+ * Full metadata produced by a fallback chain execution.
+ * Emitted alongside the SelectedQuantization for callers and audit logging.
+ */
+export interface FallbackExecutionMetadata {
+  id: string;
+  timestamp: string;
+  profileSizeTier: GenomeSizeTier;
+  targetTokens: number;
+  stepsAttempted: FallbackStepRecord[];
+  finalStepIndex: number;
+  finalBitDepth: QuantizationBitDepth;
+  finalModelTier: QuantizationModelTier;
+  /** Human-readable rationale explaining why this step was selected. */
+  selectionRationale: string;
+  totalLatencyMs: number;
+}
+
+// ---------------------------------------------------------------------------
+// Fallback Audit Persistence
+// ---------------------------------------------------------------------------
+
+/** Path to the fallback audit JSONL log (~/.ashlr/genome/quantization-fallback-audit.jsonl). */
+function fallbackAuditPath(): string {
+  return join(homedir(), ".ashlr", "genome", "quantization-fallback-audit.jsonl");
+}
+
+/**
+ * Append a FallbackExecutionMetadata record to the global audit trail.
+ * Best-effort: errors are silently swallowed to avoid disrupting the caller.
+ */
+async function appendFallbackAudit(meta: FallbackExecutionMetadata): Promise<void> {
+  try {
+    await appendJsonl(fallbackAuditPath(), meta);
+  } catch {
+    // Best-effort — audit failure must not break the caller
+  }
+}
+
+/**
+ * Load all fallback audit records from ~/.ashlr/genome/quantization-fallback-audit.jsonl.
+ */
+export async function loadFallbackAuditRecords(): Promise<FallbackExecutionMetadata[]> {
+  return readJsonl<FallbackExecutionMetadata>(fallbackAuditPath());
+}
+
+// ---------------------------------------------------------------------------
+// QuantizationFallbackExecutor
+// ---------------------------------------------------------------------------
+
+/**
+ * Evaluates whether a given fallback chain step should be considered
+ * acceptable for the profile + targetTokens context.
+ *
+ * This thin probe allows tests and callers to inject failure scenarios
+ * without requiring a real Ollama instance. The default probe always
+ * resolves immediately (no I/O), indicating "available".
+ *
+ * @returns true when the step is available; false when it should be skipped
+ *          (treated as a timeout/unavailability failure).
+ */
+export type FallbackStepProbe = (
+  step: FallbackChainStep,
+  profile: GenomeProfile,
+  targetTokens: number,
+) => Promise<boolean>;
+
+/** Default probe: always available (no real I/O). */
+const DEFAULT_PROBE: FallbackStepProbe = async () => true;
+
+/**
+ * Options for `selectQuantizationWithFallback`.
+ */
+export interface FallbackSelectionOptions {
+  /** Override the fallback chain (defaults to DEFAULT_FALLBACK_CHAIN). */
+  chain?: QuantizationFallbackChain;
+  /**
+   * Probe function that tests whether a given step is currently usable.
+   * Inject a custom probe in tests to simulate timeouts or Ollama failures.
+   * Defaults to a no-op probe (always available).
+   */
+  probe?: FallbackStepProbe;
+  /** If true, audit records are NOT written to disk. Useful for unit tests. */
+  skipAudit?: boolean;
+}
+
+/**
+ * Select the best quantization configuration for `profile` / `targetTokens`
+ * by walking the fallback chain until a step succeeds.
+ *
+ * Algorithm:
+ *  1. For each step in the chain (preferred → degraded):
+ *     a. Race `probe(step)` against the step's `timeoutMs`.
+ *     b. If the probe resolves true within the timeout → success, stop.
+ *     c. If the probe returns false or the timeout fires → record failure, continue.
+ *  2. If all steps fail the probe, the last step is used unconditionally
+ *     (guaranteed fallback).
+ *  3. Record per-step latency + outcome in FallbackExecutionMetadata.
+ *  4. Append the metadata to the global audit log (unless skipAudit=true).
+ *
+ * @param profile       GenomeProfile for the current genome (from GenomeProfiler).
+ * @param targetTokens  Token budget for the retrieval operation.
+ * @param options       Optional chain override, probe, and audit toggle.
+ */
+export async function selectQuantizationWithFallback(
+  profile: GenomeProfile,
+  targetTokens: number,
+  options: FallbackSelectionOptions = {},
+): Promise<SelectedQuantization> {
+  const chain = options.chain ?? DEFAULT_FALLBACK_CHAIN;
+  const probe = options.probe ?? DEFAULT_PROBE;
+
+  if (chain.length === 0) {
+    throw new Error("QuantizationFallbackChain must contain at least one step.");
+  }
+
+  const stepsAttempted: FallbackStepRecord[] = [];
+  const overallStart = Date.now();
+
+  for (let i = 0; i < chain.length; i++) {
+    const step = chain[i]!;
+    const stepStart = Date.now();
+
+    let outcome: FallbackStepRecord["outcome"] = "error";
+    let errorMessage: string | undefined;
+
+    try {
+      // Race the probe against the step-level timeout
+      const probePromise = probe(step, profile, targetTokens).then((ok) => {
+        if (!ok) throw new Error("probe returned false");
+        return true;
+      });
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`step timeout after ${step.timeoutMs}ms`)), step.timeoutMs),
+      );
+
+      await Promise.race([probePromise, timeoutPromise]);
+      outcome = "success";
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      errorMessage = msg;
+      outcome = msg.includes("timeout") ? "timeout" : "error";
+    }
+
+    const latencyMs = Date.now() - stepStart;
+
+    stepsAttempted.push({
+      stepIndex: i,
+      bitDepth: step.bitDepth,
+      modelTier: step.modelTier,
+      timeoutMs: step.timeoutMs,
+      latencyMs,
+      outcome,
+      ...(errorMessage !== undefined ? { errorMessage } : {}),
+    });
+
+    if (outcome === "success") {
+      // This step succeeded — build metadata and return
+      const meta = _buildFallbackMeta(
+        profile,
+        targetTokens,
+        stepsAttempted,
+        i,
+        step,
+        Date.now() - overallStart,
+      );
+
+      if (!options.skipAudit) {
+        await appendFallbackAudit(meta);
+      }
+
+      return {
+        bitDepth: step.bitDepth,
+        modelTier: step.modelTier,
+        stepIndex: i,
+        usedFallback: i > 0,
+        fallbackMeta: meta,
+      };
+    }
+  }
+
+  // All steps failed — use the last step unconditionally (guaranteed fallback)
+  const lastStep = chain[chain.length - 1]!;
+  const lastIdx = chain.length - 1;
+
+  // Correct the last stepsAttempted entry: mark it as success (forced)
+  const lastRecord = stepsAttempted[lastIdx];
+  if (lastRecord && lastRecord.outcome !== "success") {
+    stepsAttempted[lastIdx] = { ...lastRecord, outcome: "success", errorMessage: undefined };
+  }
+
+  const meta = _buildFallbackMeta(
+    profile,
+    targetTokens,
+    stepsAttempted,
+    lastIdx,
+    lastStep,
+    Date.now() - overallStart,
+    true,
+  );
+
+  if (!options.skipAudit) {
+    await appendFallbackAudit(meta);
+  }
+
+  return {
+    bitDepth: lastStep.bitDepth,
+    modelTier: lastStep.modelTier,
+    stepIndex: lastIdx,
+    usedFallback: lastIdx > 0,
+    fallbackMeta: meta,
+  };
+}
+
+/** Build a FallbackExecutionMetadata record from traversal state. */
+function _buildFallbackMeta(
+  profile: GenomeProfile,
+  targetTokens: number,
+  stepsAttempted: FallbackStepRecord[],
+  finalStepIndex: number,
+  finalStep: FallbackChainStep,
+  totalLatencyMs: number,
+  forcedFallback = false,
+): FallbackExecutionMetadata {
+  const id = `qfc-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const failedCount = stepsAttempted.filter((s) => s.outcome !== "success").length;
+
+  let rationale: string;
+  if (finalStepIndex === 0) {
+    rationale =
+      `Preferred step selected: int${finalStep.bitDepth} / ${finalStep.modelTier} ` +
+      `(no fallback needed, genome=${profile.sizeTier}).`;
+  } else if (forcedFallback) {
+    rationale =
+      `All ${stepsAttempted.length} chain steps unavailable; forced last-resort ` +
+      `int${finalStep.bitDepth} / ${finalStep.modelTier}.`;
+  } else {
+    rationale =
+      `Degraded to step ${finalStepIndex}: int${finalStep.bitDepth} / ${finalStep.modelTier} ` +
+      `after ${failedCount} failed step(s) (genome=${profile.sizeTier}, ` +
+      `targetTokens=${targetTokens}).`;
+  }
+
+  return {
+    id,
+    timestamp: new Date().toISOString(),
+    profileSizeTier: profile.sizeTier,
+    targetTokens,
+    stepsAttempted,
+    finalStepIndex,
+    finalBitDepth: finalStep.bitDepth,
+    finalModelTier: finalStep.modelTier,
+    selectionRationale: rationale,
+    totalLatencyMs,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Chain builder helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a QuantizationFallbackChain that starts from a given learner-preferred
+ * bit depth and degrades through the standard tier order.
+ *
+ * This lets the adaptive learner's recommendation act as the preferred step
+ * while still providing the full fallback safety net.
+ *
+ * Mapping: 16→accurate, 8→fast, 4→ultrafast, 32→accurate (treated like 16).
+ */
+function _buildChainFromDepth(depth: QuantizationBitDepth): QuantizationFallbackChain {
+  // Full chain anchored to the learner recommendation at the top
+  switch (depth) {
+    case 16:
+      return [
+        { bitDepth: 16, modelTier: "accurate",  timeoutMs: 5_000 },
+        { bitDepth: 16, modelTier: "balanced",  timeoutMs: 10_000 },
+        { bitDepth: 8,  modelTier: "fast",      timeoutMs: 3_000 },
+        { bitDepth: 4,  modelTier: "ultrafast", timeoutMs: 1_000 },
+      ];
+    case 8:
+      return [
+        { bitDepth: 8,  modelTier: "fast",      timeoutMs: 3_000 },
+        { bitDepth: 8,  modelTier: "balanced",  timeoutMs: 10_000 },
+        { bitDepth: 4,  modelTier: "ultrafast", timeoutMs: 1_000 },
+      ];
+    case 4:
+      return [
+        { bitDepth: 4,  modelTier: "ultrafast", timeoutMs: 1_000 },
+      ];
+    case 32:
+    default:
+      return DEFAULT_FALLBACK_CHAIN;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // QuantizationStrategyEngine — main orchestrator
 // ---------------------------------------------------------------------------
 
@@ -771,25 +1134,70 @@ export class QuantizationStrategyEngine {
   /**
    * Select the best bit-depth for the given query.
    *
-   * Returns an outcomeId that the caller should use when recording the
-   * final outcome via recordOutcome().
+   * Internally uses `selectQuantizationWithFallback` to walk the fallback
+   * chain, then records a placeholder outcome for later update via
+   * `recordOutcome()`.
+   *
+   * @param query           Natural-language or code query string.
+   * @param fallbackOptions Optional chain/probe overrides (useful in tests).
    */
-  async selectBitDepth(query: string): Promise<{
+  async selectBitDepth(
+    query: string,
+    fallbackOptions?: FallbackSelectionOptions,
+  ): Promise<{
     bitDepth: QuantizationBitDepth;
     analysis: QueryComplexityAnalysis;
     genomeSizeTier: GenomeSizeTier;
     outcomeId: string;
+    fallbackMeta?: FallbackExecutionMetadata;
   }> {
     const profile = this._profile;
     const genomeSizeTier: GenomeSizeTier = profile?.sizeTier ?? "medium";
 
     const analysis = this.classifier.analyze(query);
+
+    // Derive target token count from query complexity for chain hints
+    const targetTokens = analysis.tokenCount;
+
+    // Use learner to determine a candidate depth (no-IO, heuristic-based)
     const outcomes = await loadQuantizationOutcomes(this.cwd);
-    const bitDepth = this.learner.selectBitDepth(
+    const learnerDepth = this.learner.selectBitDepth(
       analysis.complexityClass,
       genomeSizeTier,
       outcomes,
     );
+
+    // Build a profile stub if no manifest has been loaded yet
+    const effectiveProfile: GenomeProfile = profile ?? {
+      sectionCount: 0,
+      avgSectionTokens: 0,
+      medianSectionTokens: 0,
+      maxDepth: 0,
+      hierarchyRatio: 0,
+      sizeTier: genomeSizeTier,
+      tokenPercentiles: [0, 0, 0, 0],
+    };
+
+    // Build a chain that starts from the learner's preferred depth so the
+    // fallback chain honours the adaptive learner recommendation.
+    const preferredChain = _buildChainFromDepth(learnerDepth);
+    const chain = fallbackOptions?.chain ?? preferredChain;
+
+    let bitDepth: QuantizationBitDepth;
+    let fallbackMeta: FallbackExecutionMetadata | undefined;
+
+    try {
+      const selected = await selectQuantizationWithFallback(effectiveProfile, targetTokens, {
+        ...fallbackOptions,
+        chain,
+        skipAudit: fallbackOptions?.skipAudit ?? false,
+      });
+      bitDepth = selected.bitDepth;
+      fallbackMeta = selected.fallbackMeta;
+    } catch {
+      // Fallback chain threw unexpectedly — use learner depth as last resort
+      bitDepth = learnerDepth;
+    }
 
     // Pre-record with placeholder latency; caller updates via recordOutcome
     const outcomeId = await recordQuantizationOutcome(this.cwd, {
@@ -803,7 +1211,22 @@ export class QuantizationStrategyEngine {
       matchQuality: null,
     });
 
-    return { bitDepth, analysis, genomeSizeTier, outcomeId };
+    return { bitDepth, analysis, genomeSizeTier, outcomeId, fallbackMeta };
+  }
+
+  /**
+   * Alias for `selectBitDepth` — primary entry-point when callers pass a
+   * GenomeProfile + targetTokens directly rather than a raw query string.
+   *
+   * Drives the fallback chain and returns the full SelectedQuantization
+   * (including FallbackExecutionMetadata).
+   */
+  async select(
+    profile: GenomeProfile,
+    targetTokens: number,
+    options?: FallbackSelectionOptions,
+  ): Promise<SelectedQuantization> {
+    return selectQuantizationWithFallback(profile, targetTokens, options);
   }
 
   /**
