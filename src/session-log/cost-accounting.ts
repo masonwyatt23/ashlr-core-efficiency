@@ -31,6 +31,7 @@
 
 import type { CompressionTier } from "../compression/context.ts";
 import { PROVIDER_RATES, type ProviderName, defaultProviderRate } from "../tokens/index.ts";
+import { pipeCompressionCostToLearner } from "../compression/regret-learner.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -202,6 +203,10 @@ export function recordCompressionCost(
   };
 
   _records.push(record);
+
+  // Feed into the regret learner so UCB tier selection stays up to date.
+  pipeCompressionCostToLearner(tier, tokensRemoved, provider);
+
   return record;
 }
 
