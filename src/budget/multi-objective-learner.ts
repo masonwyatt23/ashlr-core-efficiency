@@ -657,6 +657,12 @@ export class BudgetMultiObjectiveLearner {
    *   2. If in-memory sessions allow fitting, compute a fresh allocation.
    *   3. Select the best Pareto-front point given the caller's constraints.
    *   4. Fall back to a static-derived allocation when data is insufficient.
+   *   5. (Post-processing) If `opts.targetLatencyMs` or `opts.maxCostDelta` is
+   *      provided, pass the allocation through `LatencyAwareAllocator` to refine
+   *      latency estimates with the fitted polynomial model and persist the
+   *      context-window Pareto sweep to `evolution/latency-aware-allocations.jsonl`.
+   *      This step is best-effort: failures are silently swallowed so they never
+   *      block a budget recommendation.
    *
    * @param provider       Provider name (case-insensitive substring match).
    * @param modelId        Model ID (may be empty for provider-level query).
@@ -684,6 +690,8 @@ export class BudgetMultiObjectiveLearner {
       ? getModelContextLimit(modelId, provider)
       : getProviderContextLimit(provider);
 
+    let baseAllocation: BudgetAllocation;
+
     if (calibration && calibration.paretoFront.length > 0) {
       const selected = selectFromFrontier(
         calibration.paretoFront,
@@ -693,17 +701,47 @@ export class BudgetMultiObjectiveLearner {
       );
 
       if (selected) {
-        return {
+        baseAllocation = {
           ...selected.allocation,
           provider,
           modelId,
           computedAt: new Date().toISOString(),
         };
+      } else {
+        baseAllocation = this._staticFallback(provider, modelId, contextLimit);
+      }
+    } else {
+      baseAllocation = this._staticFallback(provider, modelId, contextLimit);
+    }
+
+    // Post-process with LatencyAwareAllocator when latency/cost constraints
+    // are present. This refines estimatedP99LatencyMs with polynomial model
+    // predictions and persists the context-window Pareto sweep.
+    if (opts.targetLatencyMs !== undefined || opts.maxCostDelta !== undefined) {
+      try {
+        const { LatencyAwareAllocator } = await import("./latency-aware-allocator.ts");
+        const allocator = new LatencyAwareAllocator(this.cwd);
+        await allocator.loadRecords();
+        const maxBudgetUsd =
+          opts.maxCostDelta !== undefined
+            ? baseAllocation.estimatedCostUsd + opts.maxCostDelta
+            : 1.0; // generous default when only latency is constrained
+        const targetLatencyMs = opts.targetLatencyMs ?? 2000;
+        const refined = await allocator.refineWithLatency(
+          baseAllocation,
+          targetLatencyMs,
+          maxBudgetUsd,
+        );
+        // Return only the BudgetAllocation fields (strip latencyAwareAllocations
+        // so callers see a stable BudgetAllocation type).
+        const { latencyAwareAllocations: _, ...cleanAllocation } = refined;
+        return cleanAllocation;
+      } catch {
+        // Latency refinement is best-effort — never fail a budget query.
       }
     }
 
-    // Static fallback.
-    return this._staticFallback(provider, modelId, contextLimit);
+    return baseAllocation;
   }
 
   /**

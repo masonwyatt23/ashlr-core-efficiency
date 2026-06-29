@@ -37,6 +37,18 @@ export {
   computeParetoFrontier,
 } from "./multi-objective-learner.ts";
 
+// Re-export the latency-aware context window allocator.
+export type {
+  FittedLatencyModel,
+  LatencyAwareAllocation,
+  LatencyAwareAllocationRecord,
+  LatencyCostRecord,
+} from "./latency-aware-allocator.ts";
+export {
+  CONTEXT_WINDOW_STEPS,
+  LatencyAwareAllocator,
+} from "./latency-aware-allocator.ts";
+
 /** System prompt gets this fraction of the provider's context limit. */
 export const SYSTEM_PROMPT_BUDGET_RATIO = 0.05;
 /** Hard cap so 2M-context providers (xAI) don't give a runaway budget. */
