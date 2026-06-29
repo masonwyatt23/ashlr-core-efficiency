@@ -144,6 +144,24 @@ function cacheMessages(messages: CacheableMessage[]): CacheableMessage[] {
 // ---------------------------------------------------------------------------
 
 /**
+ * Options for the optimizer-enhanced `cacheBreakpoints` overload.
+ */
+export interface CacheBreakpointsOptions {
+  /**
+   * When provided, the optimizer's recommended breakpoint indices are applied
+   * to the message array in addition to the standard system/tools markers.
+   *
+   * Pass a `BreakpointRecommendation` from
+   * `CacheBreakpointOptimizer.recommendBreakpoints()` (or the module-level
+   * `recommendBreakpoints()` helper) to activate learned breakpoints.
+   */
+  optimizerRecommendation?: {
+    /** Ascending list of message indices that should receive a cache marker. */
+    breakpointIndices: number[];
+  };
+}
+
+/**
  * Add prompt-caching breakpoints at the static→dynamic boundaries of a
  * request. Input is not mutated.
  *
@@ -151,9 +169,13 @@ function cacheMessages(messages: CacheableMessage[]): CacheableMessage[] {
  *   cache marker can be attached.
  * - Messages flagged with `cache: true` get a marker on their last content
  *   block; the last such flagged message forms the static prefix boundary.
+ * - When `options.optimizerRecommendation` is provided, additional breakpoints
+ *   from the session-log optimizer are applied to the messages at the
+ *   specified indices.
  *
  * @example
  * ```ts
+ * // Basic usage (unchanged):
  * const req = cacheBreakpoints({
  *   system: systemPrompt,
  *   tools: mcpTools,
@@ -162,16 +184,43 @@ function cacheMessages(messages: CacheableMessage[]): CacheableMessage[] {
  *     { role: 'user', content: 'actual question here' },
  *   ],
  * });
- * await client.messages.create({ ...req, model: 'claude-opus-4-5', max_tokens: 1024 });
+ *
+ * // With session-learned breakpoints:
+ * const [rec] = await recommendBreakpoints(messages);
+ * const req2 = cacheBreakpoints(
+ *   { system: systemPrompt, messages },
+ *   { optimizerRecommendation: rec },
+ * );
+ * await client.messages.create({ ...req2, model: 'claude-opus-4-5', max_tokens: 1024 });
  * ```
  */
-export function cacheBreakpoints<T extends CacheableRequest>(req: T): T {
-  return {
+export function cacheBreakpoints<T extends CacheableRequest>(
+  req: T,
+  options?: CacheBreakpointsOptions,
+): T {
+  const baseResult = {
     ...req,
     system: cacheSystem(req.system),
     tools: cacheTools(req.tools),
     messages: cacheMessages(req.messages),
   };
+
+  // Apply optimizer-recommended breakpoints if provided
+  if (
+    options?.optimizerRecommendation?.breakpointIndices &&
+    options.optimizerRecommendation.breakpointIndices.length > 0
+  ) {
+    const indices = options.optimizerRecommendation.breakpointIndices;
+    const msgs = baseResult.messages.map((msg, i) => {
+      if (indices.includes(i)) {
+        return cacheMessageTail(msg as CacheableMessage);
+      }
+      return msg;
+    });
+    return { ...baseResult, messages: msgs };
+  }
+
+  return baseResult;
 }
 
 /**

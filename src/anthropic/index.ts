@@ -33,6 +33,7 @@ export {
   type CacheableRequest,
   type CacheableSystem,
   type CacheableTool,
+  type CacheBreakpointsOptions,
   cacheBreakpoints,
   cacheMessagesBreakpoints,
 } from "./prompt-cache.ts";
@@ -59,3 +60,14 @@ export {
   type ProviderSwitchRecommendation,
   type CacheOptimizationReport,
 } from "./cache-optimizer.ts";
+
+export {
+  CacheBreakpointOptimizer,
+  recommendBreakpoints,
+  MAX_BREAKPOINTS,
+  type Message,
+  type OptimizerOptions,
+  type BreakpointROI,
+  type BreakpointRecommendation,
+  type BreakpointEvolutionRecord,
+} from "./cache-breakpoint-optimizer.ts";
