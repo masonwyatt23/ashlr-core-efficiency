@@ -48,6 +48,7 @@ import { dirname, join } from "node:path";
 import type { CompressionTier } from "../compression/context.ts";
 import { PROVIDER_RATES, type ProviderName, defaultProviderRate } from "../tokens/index.ts";
 import { pipeCompressionCostToLearner } from "../compression/regret-learner.ts";
+import { CompressorStreamFeedback, observeCompressionOutcome } from "../compression/streaming-feedback.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -124,6 +125,40 @@ export interface SessionROI {
   amnesiaCount: number;
   /** ISO-8601 timestamp when this summary was generated. */
   generatedAt: string;
+}
+
+// ---------------------------------------------------------------------------
+// Module-level CompressorStreamFeedback singleton
+// ---------------------------------------------------------------------------
+
+/**
+ * Lazily-initialised `CompressorStreamFeedback` instance wired into
+ * `recordCompressionCost` so every compression event automatically feeds
+ * the in-flight EMA optimizer without callers needing to opt in.
+ *
+ * Tests can replace this via `_setFeedbackInstance()`.
+ */
+let _feedbackInstance: CompressorStreamFeedback | null = null;
+
+function _getFeedbackInstance(): CompressorStreamFeedback {
+  if (!_feedbackInstance) {
+    _feedbackInstance = new CompressorStreamFeedback({ cwd: process.cwd() });
+  }
+  return _feedbackInstance;
+}
+
+/**
+ * Override the feedback instance — for tests only.
+ */
+export function _setFeedbackInstance(instance: CompressorStreamFeedback | null): void {
+  _feedbackInstance = instance;
+}
+
+/**
+ * Return the current feedback instance (read-only access for tests).
+ */
+export function _getFeedbackInstanceForTest(): CompressorStreamFeedback | null {
+  return _feedbackInstance;
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +263,22 @@ export function recordCompressionCost(
 
   // Feed into the regret learner so UCB tier selection stays up to date.
   pipeCompressionCostToLearner(tier, tokensRemoved, provider);
+
+  // Feed into the streaming feedback EMA optimizer so the in-flight
+  // switchboard stays current. latencyMs is not available here (this is a
+  // synchronous cost-record path), so we pass 0; the ROI computation inside
+  // observeCompressionOutcome uses max(1, latencyMs) as the denominator.
+  // toolCallSuccess defaults to true (cost recording implies a successful call).
+  observeCompressionOutcome(_getFeedbackInstance(), {
+    tier,
+    provider,
+    tokensRemoved,
+    latencyMs: timeMs,
+    toolCallSuccess: success,
+    clarificationRequested: false,
+    messageCount: 0, // unknown at this call site — bucket defaults to "xs"
+    estimatedByBlock: {},
+  });
 
   return record;
 }

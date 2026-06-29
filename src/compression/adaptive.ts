@@ -49,6 +49,7 @@ import type { Message } from "../types/index.ts";
 import type { CompressibleProfile } from "./consolidation.ts";
 import { SemanticPreFilterer } from "./semantic-prefilter.ts";
 import { bucketMessageCount, type MessageCountBucket } from "../budget/index.ts";
+import type { TierRecommendation } from "./streaming-feedback.ts";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -438,6 +439,13 @@ export async function calibrateCompressionThresholds(
  *                      `computeROI` before each LLM call can feed the result
  *                      here so that USD-based historical signal takes precedence
  *                      over token-count-based heuristics.
+ * @param liveRecommendation  Optional `TierRecommendation` from the in-flight
+ *                      `CompressorStreamFeedback` optimizer. When provided and
+ *                      its reason is not "insufficient_data", the live EMA-based
+ *                      tier recommendation takes the highest precedence over all
+ *                      other selection strategies (ROI breakdown, calibration,
+ *                      history). This enables the streaming feedback loop to act
+ *                      as a real-time override rather than a post-hoc learner.
  */
 export function selectCompressionTierAdaptive(
   messages: Message[],
@@ -449,11 +457,20 @@ export function selectCompressionTierAdaptive(
   consolidationProfile?: CompressibleProfile | null,
   skipPreFilter = false,
   roiBreakdown?: TierROIBreakdown | null,
+  liveRecommendation?: TierRecommendation | null,
 ): CompressionTier {
   const cfg = { ...DEFAULT_CONFIG, ...config };
 
   // Always compute static baseline first
   const staticTier = selectCompressionTier(messages, systemTokens, cfg);
+
+  // Live streaming feedback recommendation takes highest precedence when it
+  // carries a concrete signal (reason !== "insufficient_data"). This makes the
+  // CompressorStreamFeedback in-flight optimizer act as a real-time override
+  // rather than a post-hoc learner.
+  if (liveRecommendation != null && liveRecommendation.reason !== "insufficient_data") {
+    return liveRecommendation.tier;
+  }
 
   // No history → pure static. Apply ROI override first if available, then return.
   if (!history) {
