@@ -290,6 +290,7 @@ describe("selectCompressionTierAdaptive — provider pricing integration", () =>
       1: { tier: 1 as const, sampleCount: 10, successRate: 0.9, avgOvershootPct: 5 },
       2: { tier: 2 as const, sampleCount: 10, successRate: 0.9, avgOvershootPct: 5 },
       3: { tier: 3 as const, sampleCount: 10, successRate: 0.9, avgOvershootPct: 5 },
+      4: { tier: 4 as const, sampleCount: 10, successRate: 0.9, avgOvershootPct: 5 },
     },
   };
 
@@ -300,18 +301,18 @@ describe("selectCompressionTierAdaptive — provider pricing integration", () =>
     expect(withoutProvider).toBe(withUndefined);
   });
 
-  test("expensive provider (groq → anthropic) does not raise tier above 3", () => {
+  test("expensive provider (groq → anthropic) does not raise tier above 4", () => {
     const messages = makeMessages(5);
     const tier = selectCompressionTierAdaptive(messages, 500, {}, richHistory, null, "xai");
     expect(tier).toBeGreaterThanOrEqual(1);
-    expect(tier).toBeLessThanOrEqual(3);
+    expect(tier).toBeLessThanOrEqual(4);
   });
 
   test("cheap provider (deepseek) keeps tier in valid range", () => {
     const messages = makeMessages(5);
     const tier = selectCompressionTierAdaptive(messages, 500, {}, richHistory, null, "deepseek");
     expect(tier).toBeGreaterThanOrEqual(1);
-    expect(tier).toBeLessThanOrEqual(3);
+    expect(tier).toBeLessThanOrEqual(4);
   });
 
   test("null history → provider hint has no effect on static path", () => {
@@ -325,6 +326,6 @@ describe("selectCompressionTierAdaptive — provider pricing integration", () =>
     const messages = makeMessages(50, 1000);
     // With rich history and an extremely cheap provider, should not crash
     const tier = selectCompressionTierAdaptive(messages, 1000, {}, richHistory, null, "deepseek");
-    expect([1, 2, 3]).toContain(tier);
+    expect([1, 2, 3, 4]).toContain(tier);
   });
 });

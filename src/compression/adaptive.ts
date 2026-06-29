@@ -24,7 +24,7 @@
 
 import { join } from "path";
 import { appendJsonl, readJsonl } from "../genome/jsonl.ts";
-import { contextCollapse, selectCompressionTier, snipCompact, type CompressionTier, type ContextConfig, DEFAULT_CONFIG } from "./context.ts";
+import { contextCollapse, selectCompressionTier, snipCompact, treeCompact, type CompressionTier, type ContextConfig, DEFAULT_CONFIG } from "./context.ts";
 import { estimateTokensFromMessages } from "../tokens/index.ts";
 import { recordCompressionCost } from "../session-log/cost-accounting.ts";
 import { computeProviderCostRatio } from "../budget/index.ts";
@@ -224,15 +224,16 @@ export async function learnCompressionThresholds(
     1: [],
     2: [],
     3: [],
+    4: [],
   };
   for (const r of records) {
-    if (r.tier === 1 || r.tier === 2 || r.tier === 3) {
+    if (r.tier === 1 || r.tier === 2 || r.tier === 3 || r.tier === 4) {
       buckets[r.tier].push(r);
     }
   }
 
   const byTier = {} as Record<CompressionTier, TierEffectiveness>;
-  for (const t of [1, 2, 3] as CompressionTier[]) {
+  for (const t of [1, 2, 3, 4] as CompressionTier[]) {
     const samples = buckets[t];
     const sampleCount = samples.length;
     if (sampleCount === 0) {
@@ -282,9 +283,9 @@ export async function calibrateCompressionThresholds(
   const allRecords = await readJsonl<CompressionFeedback>(compressionHistoryPath(cwd));
 
   // Bucket ALL records by tier first, then slice the latest window from each bucket.
-  const buckets: Record<CompressionTier, CompressionFeedback[]> = { 1: [], 2: [], 3: [] };
+  const buckets: Record<CompressionTier, CompressionFeedback[]> = { 1: [], 2: [], 3: [], 4: [] };
   for (const r of allRecords) {
-    if (r.tier === 1 || r.tier === 2 || r.tier === 3) {
+    if (r.tier === 1 || r.tier === 2 || r.tier === 3 || r.tier === 4) {
       buckets[r.tier].push(r);
     }
   }
@@ -292,7 +293,7 @@ export async function calibrateCompressionThresholds(
   const byTier = {} as Record<CompressionTier, TierCalibration>;
   let anyDriftDetected = false;
 
-  for (const t of [1, 2, 3] as CompressionTier[]) {
+  for (const t of [1, 2, 3, 4] as CompressionTier[]) {
     const all = buckets[t];
     // Sliding window: take only the most recent CALIBRATION_WINDOW_SIZE records.
     const window = all.slice(-CALIBRATION_WINDOW_SIZE);
@@ -462,10 +463,10 @@ export function selectCompressionTierAdaptive(
     return calibratedTierTokens + systemTokens <= limit;
   }
 
-  // Walk from cheapest (3) to most aggressive (1), picking the first tier
+  // Walk from cheapest (4) to most aggressive (1), picking the first tier
   // that is predicted to succeed according to history.
   let selectedTier: CompressionTier = 1; // default: most aggressive fallback
-  for (const tier of [3, 2, 1] as CompressionTier[]) {
+  for (const tier of [4, 3, 2, 1] as CompressionTier[]) {
     if (tierLikelySucceeds(tier)) {
       selectedTier = tier;
       break;
@@ -502,6 +503,14 @@ export function selectCompressionTierAdaptive(
  */
 function estimatedTierTokens(messages: Message[], tier: CompressionTier): number {
   switch (tier) {
+    case 4:
+      // treeCompact: estimate using a large budget (simulate best-effort pruning)
+      return estimateTokensFromMessages(
+        treeCompact(messages, undefined, {
+          tokenBudget: 0, // force maximum pruning for estimation purposes
+          keepRecentMessages: DEFAULT_CONFIG.recentMessageCount,
+        }).messages,
+      );
     case 3:
       return estimateTokensFromMessages(contextCollapse(messages));
     case 2:

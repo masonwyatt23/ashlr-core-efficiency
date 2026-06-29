@@ -232,17 +232,17 @@ describe("tier outputs — semantic validity", () => {
 // ---------------------------------------------------------------------------
 
 describe("selectCompressionTier", () => {
-  test("returns 3 when contextCollapse alone fits within budget", () => {
-    // Small conversation — collapse easily fits
+  test("returns 4 when treeCompact alone fits within budget (cheapest tier)", () => {
+    // Small conversation — treeCompact easily fits
     const msgs: Message[] = Array.from({ length: 8 }, (_, i) =>
       textMsg(i % 2 === 0 ? "user" : "assistant", `turn ${i} text`),
     );
-    // Very large budget — any tier fits; should pick cheapest (3)
+    // Very large budget — any tier fits; should pick cheapest (4)
     const tier = selectCompressionTier(msgs, 0, {
       maxContextTokens: 1_000_000,
       reserveTokens: 8192,
     });
-    expect(tier).toBe(3);
+    expect(tier).toBe(4);
   });
 
   test("returns 2 when snipCompact fits but contextCollapse alone does not", () => {
@@ -290,19 +290,19 @@ describe("selectCompressionTier", () => {
     const msgs: Message[] = Array.from({ length: 3 }, (_, i) =>
       textMsg("user", `msg ${i}`),
     );
-    // With default 100K limit and tiny messages, should fit in tier 3
+    // With default 100K limit and tiny messages, should fit in tier 4 (cheapest)
     const tier = selectCompressionTier(msgs, 0);
-    expect(tier).toBe(3);
+    expect(tier).toBe(4);
   });
 
   test("tier selection is consistent with needsCompaction", () => {
-    // If needsCompaction says no compaction needed, tier should still be 3 (no-op is fine)
+    // If needsCompaction says no compaction needed, tier 4 should be sufficient (cheapest)
     const msgs = [textMsg("user", "small message")];
     const systemTokens = 100;
     const config = { maxContextTokens: 100_000, reserveTokens: 8192 };
     expect(needsCompaction(msgs, systemTokens, config)).toBe(false);
-    // When compaction not needed, tier 3 should be sufficient (cheapest)
-    expect(selectCompressionTier(msgs, systemTokens, config)).toBe(3);
+    // Tier 4 (treeCompact) is the new lightest/cheapest tier
+    expect(selectCompressionTier(msgs, systemTokens, config)).toBe(4);
   });
 });
 

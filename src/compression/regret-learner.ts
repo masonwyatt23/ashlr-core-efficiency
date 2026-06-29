@@ -152,10 +152,10 @@ export interface TierCostAnalysis {
 const _window: TierOutcome[] = [];
 
 /** Per-tier EMA regret (updated incrementally). */
-const _emaRegret: Record<CompressionTier, number> = { 1: 0, 2: 0, 3: 0 };
+const _emaRegret: Record<CompressionTier, number> = { 1: 0, 2: 0, 3: 0, 4: 0 };
 
 /** Per-tier all-time pull count (for UCB denominator). Not windowed. */
-const _totalPulls: Record<CompressionTier, number> = { 1: 0, 2: 0, 3: 0 };
+const _totalPulls: Record<CompressionTier, number> = { 1: 0, 2: 0, 3: 0, 4: 0 };
 
 /** Total outcomes recorded (for UCB ln(N)). Not windowed. */
 let _totalOutcomes = 0;
@@ -170,9 +170,11 @@ export function _resetLearner(): void {
   _emaRegret[1] = 0;
   _emaRegret[2] = 0;
   _emaRegret[3] = 0;
+  _emaRegret[4] = 0;
   _totalPulls[1] = 0;
   _totalPulls[2] = 0;
   _totalPulls[3] = 0;
+  _totalPulls[4] = 0;
   _totalOutcomes = 0;
 }
 
@@ -183,7 +185,7 @@ export function _getWindow(): readonly TierOutcome[] {
 
 /** Expose EMA regret snapshot for tests. */
 export function _getEmaRegret(): Readonly<Record<CompressionTier, number>> {
-  return { ..._emaRegret };
+  return { ..._emaRegret } as Readonly<Record<CompressionTier, number>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +234,12 @@ export function computeTierCost(
       // Return a small proxy cost proportional to aggressiveness so regret math works.
       return tokensRemoved * rate.inputRate * (tier === 2 ? 0.01 : 0.005);
     }
+    case 4: {
+      // treeCompact: no LLM call; prunes entire subtrees.
+      // Proxy cost is lower than tier 3 (more selective, less aggressive per-token),
+      // reflecting that it removes whole branches rather than per-message truncation.
+      return tokensRemoved * rate.inputRate * 0.003;
+    }
   }
 }
 
@@ -244,8 +252,8 @@ export function computeTierCost(
 export function bestTierInHindsight(
   costs: Record<CompressionTier, number>,
 ): CompressionTier {
-  let best: CompressionTier = 3;
-  for (const t of [1, 2, 3] as CompressionTier[]) {
+  let best: CompressionTier = 4;
+  for (const t of [1, 2, 3, 4] as CompressionTier[]) {
     if (costs[t] < costs[best]) best = t;
   }
   return best;
@@ -275,6 +283,7 @@ export function recordTierOutcome(
     1: computeTierCost(1, tokensRemoved, provider),
     2: computeTierCost(2, tokensRemoved, provider),
     3: computeTierCost(3, tokensRemoved, provider),
+    4: computeTierCost(4, tokensRemoved, provider),
   };
 
   const selectedCost = allCosts[selectedTier];
@@ -351,11 +360,11 @@ export function selectTierUCB(
 ): CompressionTier {
   const outcomes = windowOutcomes ?? _window;
 
-  if (outcomes.length === 0) return 3;
+  if (outcomes.length === 0) return 4;
 
   // Aggregate per-tier stats from outcomes.
-  const counts: Record<CompressionTier, number> = { 1: 0, 2: 0, 3: 0 };
-  const totalCosts: Record<CompressionTier, number> = { 1: 0, 2: 0, 3: 0 };
+  const counts: Record<CompressionTier, number> = { 1: 0, 2: 0, 3: 0, 4: 0 };
+  const totalCosts: Record<CompressionTier, number> = { 1: 0, 2: 0, 3: 0, 4: 0 };
 
   for (const o of outcomes) {
     counts[o.selectedTier]++;
@@ -366,17 +375,17 @@ export function selectTierUCB(
 
   // Phase 1: if any tier has fewer than MIN_UCB_SAMPLES, explore it first.
   // Prefer higher tier numbers (lighter compression) for exploration order.
-  for (const t of [3, 2, 1] as CompressionTier[]) {
+  for (const t of [4, 3, 2, 1] as CompressionTier[]) {
     if (counts[t] < MIN_UCB_SAMPLES) {
       return t;
     }
   }
 
   // Phase 2: all tiers sufficiently explored — pick minimum UCB score.
-  let bestTier: CompressionTier = 3;
+  let bestTier: CompressionTier = 4;
   let bestScore = Infinity;
 
-  for (const t of [1, 2, 3] as CompressionTier[]) {
+  for (const t of [1, 2, 3, 4] as CompressionTier[]) {
     const n = counts[t];
     const avgCost = totalCosts[t] / n;
     const exploration = UCB_C * Math.sqrt(Math.log(N + 1) / n);
@@ -412,7 +421,7 @@ export function computeTierCostAnalysis(
   const N = outcomes.length;
 
   // Bucket by selected tier.
-  const buckets: Record<CompressionTier, TierOutcome[]> = { 1: [], 2: [], 3: [] };
+  const buckets: Record<CompressionTier, TierOutcome[]> = { 1: [], 2: [], 3: [], 4: [] };
   for (const o of outcomes) {
     buckets[o.selectedTier].push(o);
   }
@@ -426,7 +435,7 @@ export function computeTierCostAnalysis(
 
   const byTier = {} as Record<CompressionTier, TierStats>;
 
-  for (const t of [1, 2, 3] as CompressionTier[]) {
+  for (const t of [1, 2, 3, 4] as CompressionTier[]) {
     const bucket = buckets[t];
     const pullCount = bucket.length;
 
@@ -458,8 +467,12 @@ export function computeTierCostAnalysis(
 
     // EMA regret (from live state, not just window).
     const emaRegret = _emaRegret[t];
+    // Only flag a tier as exceeding the threshold when it has been observed at
+    // least MIN_UCB_SAMPLES times — unexplored tiers should never trigger a shift.
     const exceedsRegretThreshold =
-      meanIdealCost > 0 && emaRegret > REGRET_THRESHOLD * meanIdealCost;
+      pullCount >= MIN_UCB_SAMPLES &&
+      meanIdealCost > 0 &&
+      emaRegret > REGRET_THRESHOLD * meanIdealCost;
 
     byTier[t] = {
       tier: t,
@@ -476,15 +489,15 @@ export function computeTierCostAnalysis(
   const recommendedTier: CompressionTier = selectTierUCB(outcomes);
 
   // Build recommendation string.
-  const shiftRecommended = ([1, 2, 3] as CompressionTier[]).some(
+  const shiftRecommended = ([1, 2, 3, 4] as CompressionTier[]).some(
     (t) => byTier[t].exceedsRegretThreshold,
   );
 
   let recommendation: string;
   if (N === 0) {
-    recommendation = "Insufficient data — defaulting to tier 3 (lightest compression).";
+    recommendation = "Insufficient data — defaulting to tier 4 (lightest compression).";
   } else if (shiftRecommended) {
-    const highRegretTiers = ([1, 2, 3] as CompressionTier[]).filter(
+    const highRegretTiers = ([1, 2, 3, 4] as CompressionTier[]).filter(
       (t) => byTier[t].exceedsRegretThreshold,
     );
     const pct = (byTier[highRegretTiers[0]!].emaRegret / (meanIdealCost || 1)) * 100;

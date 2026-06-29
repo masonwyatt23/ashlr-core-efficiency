@@ -60,13 +60,14 @@ async function seedHistory(cwd: string, records: Omit<CompressionFeedback, "reco
  * Build a LearnedThresholds object programmatically (no file I/O)
  * for unit testing selectCompressionTierAdaptive directly.
  */
-function makeThresholds(overrides: Partial<Record<1 | 2 | 3, { successRate: number; avgOvershootPct: number; sampleCount: number }>>): LearnedThresholds {
+function makeThresholds(overrides: Partial<Record<1 | 2 | 3 | 4, { successRate: number; avgOvershootPct: number; sampleCount: number }>>): LearnedThresholds {
   const defaults = { successRate: 1.0, avgOvershootPct: 0, sampleCount: 5 };
   return {
     byTier: {
       1: { tier: 1, ...defaults, ...overrides[1] },
       2: { tier: 2, ...defaults, ...overrides[2] },
       3: { tier: 3, ...defaults, ...overrides[3] },
+      4: { tier: 4, ...defaults, ...overrides[4] },
     },
   };
 }
@@ -282,38 +283,40 @@ describe("selectCompressionTierAdaptive — fallback to static", () => {
 // selectCompressionTierAdaptive — tier 3 preferred when it historically succeeds
 // ---------------------------------------------------------------------------
 
-describe("selectCompressionTierAdaptive — prefers tier 3 when historically successful", () => {
-  test("chooses tier 3 when it has high success rate and fits budget", () => {
-    // Small messages easily fit within tier 3 after collapse
+describe("selectCompressionTierAdaptive — prefers lightest tier when historically successful", () => {
+  test("chooses tier 4 when it has high success rate and fits budget (lightest tier)", () => {
+    // Small messages easily fit within tier 4 (treeCompact) with a large budget
     const msgs = Array.from({ length: 8 }, (_, i) =>
       textMsg(i % 2 === 0 ? "user" : "assistant", `turn ${i} text`),
     );
     const history = makeThresholds({
+      4: { successRate: 0.95, avgOvershootPct: 5, sampleCount: 10 },
       3: { successRate: 0.95, avgOvershootPct: 5, sampleCount: 10 },
       2: { successRate: 0.80, avgOvershootPct: 10, sampleCount: 10 },
       1: { successRate: 0.99, avgOvershootPct: 0, sampleCount: 10 },
     });
     const tier = selectCompressionTierAdaptive(msgs, 0, { maxContextTokens: 1_000_000, reserveTokens: 8192 }, history);
-    expect(tier).toBe(3);
+    expect(tier).toBe(4);
   });
 
-  test("tier 3 chosen more often (in a sweep) when it consistently succeeds", () => {
-    // Simulate 10 calls with different message sizes — tier 3 should win for small ones
+  test("tier 4 chosen more often (in a sweep) when it consistently succeeds", () => {
+    // Simulate 10 calls with different message sizes — tier 4 should win for small ones
     const history = makeThresholds({
+      4: { successRate: 0.95, avgOvershootPct: 2, sampleCount: 20 },
       3: { successRate: 0.95, avgOvershootPct: 2, sampleCount: 20 },
       2: { successRate: 0.70, avgOvershootPct: 15, sampleCount: 20 },
       1: { successRate: 0.99, avgOvershootPct: 0, sampleCount: 20 },
     });
-    let tier3Count = 0;
+    let tier4Count = 0;
     for (let size = 2; size <= 20; size += 2) {
       const msgs = Array.from({ length: size }, (_, i) =>
         textMsg(i % 2 === 0 ? "user" : "assistant", `turn ${i}`),
       );
       const t = selectCompressionTierAdaptive(msgs, 0, { maxContextTokens: 1_000_000, reserveTokens: 8192 }, history);
-      if (t === 3) tier3Count++;
+      if (t === 4) tier4Count++;
     }
-    // With a huge budget, tier 3 should be chosen for most/all sizes
-    expect(tier3Count).toBeGreaterThanOrEqual(7);
+    // With a huge budget, tier 4 should be chosen for most/all sizes
+    expect(tier4Count).toBeGreaterThanOrEqual(7);
   });
 });
 
@@ -322,19 +325,20 @@ describe("selectCompressionTierAdaptive — prefers tier 3 when historically suc
 // ---------------------------------------------------------------------------
 
 describe("selectCompressionTierAdaptive — escalates when lower tiers fail", () => {
-  test("escalates from tier 3 to tier 2 when tier 3 has poor success rate", () => {
-    // Messages that the static selector would choose tier 3 for (small)
+  test("escalates from tier 4/3 to tier 2 when tier 4 and 3 have poor success rate", () => {
+    // Messages that the static selector would choose tier 4 for (small)
     const msgs = Array.from({ length: 8 }, (_, i) =>
       textMsg(i % 2 === 0 ? "user" : "assistant", `turn ${i}`),
     );
-    // Tier 3 has failed consistently; tier 2 is better
+    // Tiers 4 and 3 have failed consistently; tier 2 is better
     const history = makeThresholds({
+      4: { successRate: 0.2, avgOvershootPct: 80, sampleCount: 10 },
       3: { successRate: 0.2, avgOvershootPct: 80, sampleCount: 10 },
       2: { successRate: 0.9, avgOvershootPct: 5, sampleCount: 10 },
       1: { successRate: 0.99, avgOvershootPct: 0, sampleCount: 10 },
     });
     const tier = selectCompressionTierAdaptive(msgs, 0, { maxContextTokens: 1_000_000, reserveTokens: 8192 }, history);
-    // Should escalate: tier 3 poor → try tier 2
+    // Should escalate: tiers 4+3 poor → try tier 2
     expect(tier).toBeLessThanOrEqual(2);
   });
 
@@ -345,19 +349,20 @@ describe("selectCompressionTierAdaptive — escalates when lower tiers fail", ()
       msgs.push(largeTool(`t${i}`, "X".repeat(5000)));
     }
 
-    // Tier 3 and tier 2 both have poor history — only tier 1 passes the successRate threshold.
-    // With enough samples on tiers 3 and 2, the learned logic should walk past them and pick tier 1.
+    // Tiers 4, 3 and 2 all have poor history — only tier 1 passes the successRate threshold.
+    // With enough samples on tiers 4, 3 and 2, the learned logic should walk past them and pick tier 1.
     const history = makeThresholds({
+      4: { successRate: 0.3, avgOvershootPct: 60, sampleCount: 10 },
       3: { successRate: 0.3, avgOvershootPct: 60, sampleCount: 10 },
       2: { successRate: 0.25, avgOvershootPct: 70, sampleCount: 10 },
       1: { successRate: 0.95, avgOvershootPct: 0, sampleCount: 10 },
     });
-    // Use a very large budget so static would pick tier 3; the history should override.
+    // Use a very large budget so static would pick tier 4; the history should override.
     const tier = selectCompressionTierAdaptive(msgs, 0, {
       maxContextTokens: 1_000_000,
       reserveTokens: 0,
     }, history);
-    // Both tier 3 and tier 2 have poor history → should prefer tier 1
+    // Tiers 4, 3 and 2 have poor history → should prefer tier 1
     expect(tier).toBe(1);
   });
 
@@ -383,8 +388,8 @@ describe("selectCompressionTierAdaptive — escalates when lower tiers fail", ()
 // ---------------------------------------------------------------------------
 
 describe("selectCompressionTierAdaptive — calibration via overshoot", () => {
-  test("large positive overshoot on tier 3 causes escalation when budget is tight", async () => {
-    // Msgs whose tier-3 collapsed estimate is ~small (say ~10 tokens).
+  test("large positive overshoot on tiers 4 and 3 causes escalation when budget is tight", async () => {
+    // Msgs whose tier-4/3 collapsed estimate is ~small (say ~10 tokens).
     // With 200% overshoot the calibrated prediction is 30 tokens.
     // We set a budget of 20 tokens so: raw estimate fits, calibrated does not.
     // Tier 2 has only 5% overshoot so its calibrated estimate easily fits.
@@ -392,6 +397,7 @@ describe("selectCompressionTierAdaptive — calibration via overshoot", () => {
       textMsg(i % 2 === 0 ? "user" : "assistant", `turn ${i}`),
     );
     const history = makeThresholds({
+      4: { successRate: 0.9, avgOvershootPct: 200, sampleCount: 10 },
       3: { successRate: 0.9, avgOvershootPct: 200, sampleCount: 10 },
       2: { successRate: 0.9, avgOvershootPct: 5, sampleCount: 10 },
       1: { successRate: 0.99, avgOvershootPct: 0, sampleCount: 10 },
@@ -400,26 +406,27 @@ describe("selectCompressionTierAdaptive — calibration via overshoot", () => {
     const { estimateTokensFromMessages: est } = await import("../src/tokens/index.ts");
     const { contextCollapse: cc } = await import("../src/compression/context.ts");
     const t3Tokens = est(cc(msgs));
-    // Budget: above raw tier-3 estimate but below calibrated (3×) tier-3 estimate
+    // Budget: above raw tier-3 estimate but below calibrated (3×) estimate
     const tightBudget = Math.round(t3Tokens * 1.5);
 
     const tier = selectCompressionTierAdaptive(msgs, 0, {
       maxContextTokens: tightBudget + 8192,
       reserveTokens: 8192,
     }, history);
-    // With 200% overshoot calibration, tier 3 no longer fits → should pick tier 2 or 1
+    // With 200% overshoot calibration, tiers 4+3 no longer fit → should pick tier 2 or 1
     expect(tier).toBeLessThanOrEqual(2);
   });
 
   test("slight overshoot does not change tier when budget is ample", () => {
     const msgs = Array.from({ length: 5 }, (_, i) => textMsg("user", `msg ${i}`));
     const history = makeThresholds({
+      4: { successRate: 0.95, avgOvershootPct: 10, sampleCount: 10 },
       3: { successRate: 0.95, avgOvershootPct: 10, sampleCount: 10 },
       2: { successRate: 0.95, avgOvershootPct: 10, sampleCount: 10 },
       1: { successRate: 0.99, avgOvershootPct: 0, sampleCount: 10 },
     });
     const tier = selectCompressionTierAdaptive(msgs, 0, { maxContextTokens: 1_000_000, reserveTokens: 8192 }, history);
-    expect(tier).toBe(3);
+    expect(tier).toBe(4); // tier 4 is now the lightest/cheapest
   });
 });
 
@@ -432,10 +439,10 @@ describe("end-to-end: record → learn → select", () => {
   beforeEach(async () => { tmp = await makeTmpDir(); });
   afterEach(async () => { await rm(tmp, { recursive: true, force: true }); });
 
-  test("tier 3 is chosen after recording many tier-3 successes", async () => {
-    // Seed 5 tier-3 successes with accurate estimates
+  test("tier 4 is chosen after recording many tier-4 successes (lightest tier)", async () => {
+    // Seed 5 tier-4 successes with accurate estimates
     for (let i = 0; i < 5; i++) {
-      await recordCompressionResult(tmp, 3, 1000, 1010, true);
+      await recordCompressionResult(tmp, 4, 1000, 1010, true);
     }
     const learned = await learnCompressionThresholds(tmp);
     expect(learned).not.toBeNull();
@@ -444,7 +451,7 @@ describe("end-to-end: record → learn → select", () => {
       textMsg(i % 2 === 0 ? "user" : "assistant", `turn ${i}`),
     );
     const tier = selectCompressionTierAdaptive(msgs, 0, { maxContextTokens: 1_000_000, reserveTokens: 8192 }, learned);
-    expect(tier).toBe(3);
+    expect(tier).toBe(4);
   });
 
   test("returns null learned thresholds when cwd has no genome", async () => {
@@ -638,7 +645,7 @@ describe("selectCompressionTierAdaptive — calibration parameter integration", 
    * Build a CalibrationRecommendation inline (no file I/O).
    */
   function makeCalibration(
-    overrides: Partial<Record<1 | 2 | 3, { driftDetected: boolean; weightAdjustment: number; mape: number }>>,
+    overrides: Partial<Record<1 | 2 | 3 | 4, { driftDetected: boolean; weightAdjustment: number; mape: number }>>,
   ): CalibrationRecommendation {
     const defaults = { driftDetected: false, weightAdjustment: 1.0, mape: 2, windowSize: 10 };
     return {
@@ -646,6 +653,7 @@ describe("selectCompressionTierAdaptive — calibration parameter integration", 
         1: { tier: 1, ...defaults, ...overrides[1] },
         2: { tier: 2, ...defaults, ...overrides[2] },
         3: { tier: 3, ...defaults, ...overrides[3] },
+        4: { tier: 4, ...defaults, ...overrides[4] },
       },
       anyDriftDetected: Object.values(overrides).some((v) => v?.driftDetected ?? false),
       tolerance: 0.15,
@@ -654,25 +662,27 @@ describe("selectCompressionTierAdaptive — calibration parameter integration", 
   }
 
   test("calibration weight overrides history overshoot when drift is detected", () => {
-    // History says tier 3 has 5% overshoot (minor). Calibration says drift detected
-    // with 2.5× weight — this should make tier 3 look much more expensive and cause
-    // escalation when the budget is tight.
+    // History says tiers 4 and 3 have 5% overshoot (minor). Calibration says drift
+    // detected with 2.5× weight on both — this should make them look expensive and
+    // cause escalation when the budget is tight.
     const msgs = Array.from({ length: 8 }, (_, i) =>
       textMsg(i % 2 === 0 ? "user" : "assistant", `turn ${i}`),
     );
     const history = makeThresholds({
+      4: { successRate: 0.95, avgOvershootPct: 5, sampleCount: 10 },
       3: { successRate: 0.95, avgOvershootPct: 5, sampleCount: 10 },
       2: { successRate: 0.95, avgOvershootPct: 5, sampleCount: 10 },
       1: { successRate: 0.99, avgOvershootPct: 0, sampleCount: 10 },
     });
     const calibration = makeCalibration({
+      4: { driftDetected: true, weightAdjustment: 2.5, mape: 40 },
       3: { driftDetected: true, weightAdjustment: 2.5, mape: 40 },
     });
 
     const { estimateTokensFromMessages: est } = require("../src/tokens/index.ts");
     const { contextCollapse: cc } = require("../src/compression/context.ts");
     const t3Tokens = est(cc(msgs));
-    // Budget: fits raw tier-3, but NOT 2.5× calibrated tier-3
+    // Budget: fits raw tier-3/4, but NOT 2.5× calibrated tier-3/4
     const tightBudget = Math.round(t3Tokens * 1.8);
 
     const tierWithCalibration = selectCompressionTierAdaptive(
@@ -682,7 +692,7 @@ describe("selectCompressionTierAdaptive — calibration parameter integration", 
       history,
       calibration,
     );
-    // With 2.5× weight on tier 3, it no longer fits → should escalate
+    // With 2.5× weight on tiers 4+3, they no longer fit → should escalate to tier 2 or 1
     expect(tierWithCalibration).toBeLessThanOrEqual(2);
   });
 

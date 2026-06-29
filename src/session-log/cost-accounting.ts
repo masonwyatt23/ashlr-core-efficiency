@@ -144,7 +144,7 @@ export function _resetRecords(): void {
  * @returns             The recorded `CompressionCostRecord`.
  */
 export function recordCompressionCost(
-  tier: 1 | 2 | 3,
+  tier: 1 | 2 | 3 | 4,
   tokensRemoved: number,
   timeMs: number,
   success: boolean,
@@ -183,6 +183,12 @@ export function recordCompressionCost(
     }
     case 3: {
       // contextCollapse: purely local; every removed token saves its full input rate cost.
+      llmCallCost = 0;
+      costSaved = tokensRemoved * rate.inputRate;
+      break;
+    }
+    case 4: {
+      // treeCompact: purely local subtree pruning; every removed token saves at full input rate.
       llmCallCost = 0;
       costSaved = tokensRemoved * rate.inputRate;
       break;
@@ -226,6 +232,7 @@ export function summarizeSessionROI(): SessionROI & { toCSV(): string } {
     1: { callCount: 0, tokensRemoved: 0, costSaved: 0 },
     2: { callCount: 0, tokensRemoved: 0, costSaved: 0 },
     3: { callCount: 0, tokensRemoved: 0, costSaved: 0 },
+    4: { callCount: 0, tokensRemoved: 0, costSaved: 0 },
   };
 
   let totalTokensSaved = 0;
