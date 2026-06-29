@@ -105,6 +105,16 @@ export interface OptimizerOptions {
    * Defaults to `~/.ashlr/cache-breakpoint-evolution.jsonl`.
    */
   auditPath?: string;
+  /**
+   * Optional provider hint (e.g. "anthropic", "openai", "gemini", "o1").
+   *
+   * When supplied, `recommendBreakpoints` auto-selects the matching
+   * `ProviderCacheStrategy` from the registry and clamps `maxBreakpoints`
+   * to the provider's limit.  For providers that do not support explicit
+   * breakpoints (e.g. OpenAI implicit caching) the method returns an empty
+   * array immediately rather than running the session-log analysis.
+   */
+  providerHint?: string;
 }
 
 /**
@@ -502,6 +512,28 @@ export class CacheBreakpointOptimizer {
     messages: Message[],
     options: OptimizerOptions = {},
   ): Promise<BreakpointRecommendation[]> {
+    // When a providerHint is given, consult the registry to enforce per-provider
+    // constraints before running the optimizer.
+    if (options.providerHint) {
+      // Dynamic import avoids a circular dependency:
+      //   cache-breakpoint-optimizer → multi-provider-adapter → cache-breakpoint-optimizer
+      const { resolveProviderStrategy } = await import("./multi-provider-adapter.ts");
+      const strategy = resolveProviderStrategy(options.providerHint);
+
+      // Providers without cache support or without explicit breakpoints: early exit.
+      if (!strategy.supported || !strategy.explicitBreakpoints) {
+        return [];
+      }
+
+      // Clamp maxBreakpoints to the provider's limit.
+      options = {
+        ...options,
+        maxBreakpoints: options.maxBreakpoints != null
+          ? Math.min(options.maxBreakpoints, strategy.maxBreakpoints)
+          : strategy.maxBreakpoints,
+      };
+    }
+
     const maxBp          = Math.min(options.maxBreakpoints ?? DEFAULT_MAX_BREAKPOINTS, MAX_BREAKPOINTS);
     const inputPrice     = options.inputPricePerMToken ?? 3.0;
     const minRoi         = options.minRoiMicroUsd ?? 1;

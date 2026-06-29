@@ -325,6 +325,66 @@ export class ProviderCostOracle {
     return { inputPerMToken: 3.0, outputPerMToken: 15.0, cacheReadPerMToken: 0.30 };
   }
 
+  // -------------------------------------------------------------------------
+  // Cache strategy extensions
+  // -------------------------------------------------------------------------
+
+  /**
+   * Return the `ProviderCacheStrategy` for the given provider name or model ID.
+   *
+   * Delegates to `resolveProviderStrategy` in `multi-provider-adapter.ts` via
+   * a dynamic import to avoid a circular module dependency.
+   *
+   * @param providerOrModel  Provider name (e.g. "anthropic") or model ID
+   *                         (e.g. "o1", "gemini-1.5-pro").
+   */
+  async getCacheStrategy(
+    providerOrModel: string,
+  ): Promise<import("../anthropic/multi-provider-adapter.ts").ProviderCacheStrategy> {
+    const { resolveProviderStrategy } = await import("../anthropic/multi-provider-adapter.ts");
+    return resolveProviderStrategy(providerOrModel);
+  }
+
+  /**
+   * Compute the estimated cache cost in micro-USD for a given number of
+   * cached (read) and written tokens, using the oracle's EMA-calibrated
+   * pricing combined with the provider's cache cost multipliers.
+   *
+   * Returns 0 for providers that do not support caching (e.g. o1/o3).
+   *
+   * @param providerOrModel   Provider name or model ID.
+   * @param cachedTokens      Tokens served from the cache (read pass).
+   * @param writtenTokens     Tokens written into the cache (write pass).
+   */
+  async getCalibratedCacheCost(
+    providerOrModel: string,
+    cachedTokens: number,
+    writtenTokens: number,
+  ): Promise<number> {
+    const strategy = await this.getCacheStrategy(providerOrModel);
+    if (!strategy.supported) return 0;
+
+    const rate = this.getCalibratedRate(strategy.provider);
+
+    const readCostMicroUsd =
+      (cachedTokens / 1_000_000) *
+      rate.inputPerMToken *
+      strategy.readCostMultiplier *
+      1_000_000;
+
+    const writeCostMicroUsd =
+      (writtenTokens / 1_000_000) *
+      rate.inputPerMToken *
+      strategy.writeCostMultiplier *
+      1_000_000;
+
+    return Math.round(readCostMicroUsd + writeCostMicroUsd);
+  }
+
+  // -------------------------------------------------------------------------
+  // Housekeeping (private)
+  // -------------------------------------------------------------------------
+
   /**
    * Check whether the cache needs housekeeping (age or size thresholds).
    *

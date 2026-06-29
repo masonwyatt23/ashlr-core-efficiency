@@ -71,3 +71,27 @@ export {
   type BreakpointRecommendation,
   type BreakpointEvolutionRecord,
 } from "./cache-breakpoint-optimizer.ts";
+
+export {
+  MultiBreakpointOrchestrator,
+  recommendCacheStrategy,
+  type TranscriptTurn,
+  type TurnTier,
+  type MultiBreakpointStrategy,
+  type CacheStrategy_MultiBreakpoint,
+  type OrchestratorOptions,
+  type OrchestratorAuditRecord,
+} from "./multi-breakpoint-orchestrator.ts";
+
+export {
+  MultiProviderAdapter,
+  recommendProviderCacheStrategy,
+  resolveProviderStrategy,
+  normalizeProviderKey,
+  PROVIDER_CACHE_STRATEGIES,
+  type ProviderCacheStrategy,
+  type MultiProviderAdapterOptions,
+  type CacheAdapterResult,
+  type CacheDegradation,
+  type AdapterOutcome,
+} from "./multi-provider-adapter.ts";
