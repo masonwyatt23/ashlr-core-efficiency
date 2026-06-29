@@ -24,6 +24,7 @@ import {
   type SectionMeta,
   sectionPath,
 } from "./manifest.ts";
+import type { DistributedSectionMeta } from "./distributed-manifest.ts";
 
 // ---------------------------------------------------------------------------
 // Scoring
@@ -831,4 +832,110 @@ export async function retrieveSectionsAdaptive(
   });
 
   return { sections, strategy: usedStrategy, latency_ms, relevance_score };
+}
+
+// ---------------------------------------------------------------------------
+// Distributed retrieval — multi-workspace / monorepo support
+// ---------------------------------------------------------------------------
+
+/**
+ * Retrieve genome sections across multiple workspace roots using a single
+ * merged IDF computed over the entire distributed corpus.
+ *
+ * This avoids the "large project bias" that would occur if IDF were computed
+ * independently per workspace: a term that is common within one large
+ * workspace is still correctly weighted against the full multi-workspace
+ * section pool.
+ *
+ * Algorithm:
+ *  1. Load & merge sections from all supplied `cwds` via
+ *     `loadDistributedManifest`.
+ *  2. Build IDF across the **full** merged section set so term rareness is
+ *     measured globally.
+ *  3. Score every section against the query using the global IDF.
+ *  4. Pack top-scoring sections within `maxTokens`, reading content from the
+ *     originating workspace root (tracked via `_origin` on each section).
+ *
+ * @param query      Natural-language query / task description.
+ * @param cwds       Workspace roots to include in the distributed search.
+ * @param maxTokens  Token budget for the returned sections combined.
+ * @returns          Retrieved sections, sorted by relevance descending.
+ *                   Each returned section carries `_origin` (the workspace
+ *                   root it came from) on the `path` field's parent metadata
+ *                   via the `metadata` property.
+ */
+export async function retrieveSectionsFromDist(
+  query: string,
+  cwds: string[],
+  maxTokens: number,
+): Promise<RetrievedSection[]> {
+  const { loadDistributedManifest } = await import("./distributed-manifest.ts");
+  const merged = await loadDistributedManifest(cwds);
+  if (!merged || merged.sections.length === 0) return [];
+
+  const queryTerms = tokenize(query);
+  if (queryTerms.length === 0) {
+    // No meaningful query — return core sections from the base (first) workspace
+    return retrieveCoreSections(cwds[0] ?? ".", merged as unknown as GenomeManifest, maxTokens);
+  }
+
+  // Build IDF over the full merged corpus for unbiased cross-workspace scoring
+  const idf = buildIDF(merged.sections);
+
+  const scored: Array<{ section: DistributedSectionMeta; score: number }> = merged.sections
+    .map((section) => ({
+      section,
+      score: scoreSection(section, queryTerms, idf),
+    }))
+    .filter((s) => s.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  if (scored.length === 0) return [];
+
+  // Pack sections within the token budget, reading content from the originating root
+  const results: RetrievedSection[] = [];
+  let usedTokens = 0;
+
+  for (const { section, score } of scored) {
+    if (usedTokens >= maxTokens) break;
+
+    // Determine which root to read the file from
+    const origin = section._origin ?? cwds[0] ?? ".";
+
+    let content: string;
+    try {
+      const fullPath = sectionPath(origin, section.path);
+      content = await readFile(fullPath, "utf-8");
+    } catch {
+      continue; // File missing or path traversal rejected — skip
+    }
+
+    const tokens = estimateTokens(content);
+
+    if (usedTokens + tokens > maxTokens) {
+      const remaining = maxTokens - usedTokens;
+      if (remaining > 200) {
+        results.push({
+          path: section.path,
+          title: section.title,
+          content: content.slice(0, remaining * 4) + "\n\n[... section truncated ...]",
+          tokens: remaining,
+          score,
+        });
+        usedTokens += remaining;
+      }
+      break;
+    }
+
+    results.push({
+      path: section.path,
+      title: section.title,
+      content,
+      tokens,
+      score,
+    });
+    usedTokens += tokens;
+  }
+
+  return results;
 }

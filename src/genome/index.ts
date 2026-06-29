@@ -31,3 +31,4 @@ export * from "./embedding-cache-coherence.ts";
 export * from "./example-profiler.ts";
 export * from "./example-selector.ts";
 export * from "./reranker-ensemble.ts";
+export * from "./distributed-manifest.ts";
