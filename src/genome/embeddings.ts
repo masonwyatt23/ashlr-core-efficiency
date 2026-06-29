@@ -15,6 +15,7 @@ import { mkdir, readFile, rename, writeFile } from "fs/promises";
 import { dirname, join } from "path";
 import { estimateTokens, genomeDir, loadManifest, type SectionMeta } from "./manifest.ts";
 import type { RetrievedSection } from "./retriever.ts";
+import { globalCodecRegistry } from "./embedding-codec.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -42,6 +43,14 @@ export interface EmbeddingCache {
   quantization_max?: number;
   /** Mean absolute error between original and reconstructed embedding */
   quantError?: number;
+  /**
+   * Codec format used to serialize this embedding (from EmbeddingCodecRegistry).
+   * Absent on legacy entries written before the codec registry existed — those
+   * are treated as float32 by getCodecForEmbedding().
+   */
+  codec_format?: string;
+  /** Codec version for forward compatibility. Currently always 1. */
+  codec_version?: 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -411,17 +420,26 @@ export async function updateEmbeddings(
       continue;
     }
 
+    // Determine codec format for this entry
+    const codecFormat = quantize ? (bitDepth === 8 ? "int8" : "int16") : "float32";
+
     const entry: EmbeddingCache = {
       sectionPath: section.path,
       embedding,
       contentHash: hash,
       updatedAt: new Date().toISOString(),
+      codec_format: codecFormat,
+      codec_version: 1,
     };
 
     if (quantize) {
-      const { quantized, min, max } = quantizeEmbedding(embedding, bitDepth);
-      const reconstructed = dequantizeEmbedding(quantized, min, max);
+      // Use the registry codec to perform quantize + reconstruct for error measurement
+      const codec = globalCodecRegistry.get(codecFormat);
+      const bytes = codec.serialize(embedding);
+      const reconstructed = codec.deserialize(bytes);
       const err = quantizationError(embedding, reconstructed);
+      // Also run legacy path to populate the existing quantization fields for backward compat
+      const { quantized, min, max } = quantizeEmbedding(embedding, bitDepth);
       const simOriginal = cosineSimilarity(embedding, embedding); // = 1.0
       const simReconstructed = cosineSimilarity(embedding, reconstructed);
       const simDelta = Math.abs(simOriginal - simReconstructed);
